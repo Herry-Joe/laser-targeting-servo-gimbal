@@ -2,7 +2,7 @@
 
 > 项目：28BYJ-48 微型减速步进电机云台 · 激光打靶系统（K230 视觉板 + STM32F103C8T6）
 > 评估范围：K230↔STM32 串口链路、蓝牙/调试遥测、错误处理、延迟与可靠性；以及整体架构、耦合度、性能瓶颈、安全性、可扩展性、代码质量。
-> 代码基线：`k230/main.py`（v4.1）、`stm32_tb6612_28byj48_demo/src/main.c`（v4.5）、`stepper.c/.h`、`ssd1306.c/.h`、`oled_debug.c/.h`
+> 代码基线：`k230/main.py`（v4.1）、`stm32_uln2003_28byj48_demo/src/main.c`（v4.5）、`stepper.c/.h`、`ssd1306.c/.h`、`oled_debug.c/.h`
 
 ---
 

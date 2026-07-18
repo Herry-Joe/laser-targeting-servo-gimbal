@@ -258,7 +258,7 @@ VS Code + PlatformIO 插件（自动下载 arm-none-eabi-gcc 和 STM32CubeF1 HAL
 ### 编译
 
 ```bash
-cd stm32_tb6612_28byj48_demo
+cd stm32_uln2003_28byj48_demo
 pio run
 ```
 
@@ -422,7 +422,7 @@ E:(+12,-5)
 ## 文件结构
 
 ```
-stm32_tb6612_28byj48_demo/
+stm32_uln2003_28byj48_demo/
 ├── platformio.ini
 ├── include/
 │   ├── main.h / stepper.h / ssd1306.h / oled_debug.h / stm32f1xx_hal_conf.h
