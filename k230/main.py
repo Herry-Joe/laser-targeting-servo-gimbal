@@ -39,19 +39,20 @@ OUT_W      = 1920
 OUT_H      = 1080
 
 # 激光 (CHN1 RGB565 800x480) — 红色 LAB 阈值
-RED_LASER_LAB      = [(52, 67, 16, 63, -36, 24)]   # 主阈值(标准红色, 快速扫描)
-RED_LASER_LAB_USER = [(45, 79, 25, 68, -4, 28)]    # 用户实测: 不同位置激光偏色范围
-RED_LASER_LAB_MULTI = RED_LASER_LAB + RED_LASER_LAB_USER  # 多阈值同时搜索,覆盖位置漂移
-RED_LASER_LAB_WIDE = [(45, 75, 0, 75, -45, 40)]    # 兜底阈值: 放宽 L/A/B, 捕捉偏暗/偏亮/略偏色激光
-LASER_MIN_PX       = 3
-LASER_MAX_PX       = 600        # 放宽上限: 较亮/较大激光点不再被误判为反光而丢弃
-LASER_WASHOUT_PX   = 6000       # 超过此面积的红块视为整屏泛红/反光, 直接拒(约 1.5% 画面)
-LASER_LOCK_FRAMES  = 2          # 连续 N 帧命中才锁定(抗单帧噪声)
-LASER_LOST_FRAMES  = 4          # 连续 N 帧未命中才释放锁定(约 130ms@30fps, 释放够快)
-LASER_POS_ALPHA    = 0.5        # 激光位置 EMA 系数(越小越平滑)
-LASER_MASK_PAD     = 8
-LASER_ROI_SIZE     = 61         # 锁定后局部搜索 ROI 边长(像素)
-LASER_TRACK_MAX_D  = 80         # 锁定后最大允许帧间位移(px), 超过则改按面积选(防跟丢后跳变)
+# v4.16: 合并多阈值为单一宽阈值 — 消除"不同阈值在不同帧搜到不同位置"的跳变。
+#   原 RED_LASER_LAB + RED_LASER_LAB_USER 两组阈值会互相竞争: 帧 N 用阈值1找到位置A,
+#   帧 N+1 用阈值2找到位置B, 最近邻跟踪也挡不住。合并后一次 find_blobs 返回所有候选,
+#   由质量过滤统一决策, 一致性大幅提升。
+RED_LASER_LAB_MERGED = [(45, 79, 16, 68, -36, 28)] # 合并: L=45~79, A=16~68, B=-36~28
+RED_LASER_LAB_WIDE   = [(45, 75, 0, 75, -45, 40)]  # 兜底阈值: 放宽 L/A/B
+LASER_MIN_PX        = 3
+LASER_MAX_PX        = 600        # 放宽上限
+LASER_WASHOUT_PX    = 6000       # 整屏泛红/反光拒识
+LASER_LOCK_FRAMES   = 2          # 连续 N 帧命中才锁定
+LASER_LOST_FRAMES   = 5          # v4.16: 4→5, 更容忍短暂丢失(之前130ms→160ms)
+LASER_POS_ALPHA     = 0.35       # v4.16: 0.5→0.35, EMA 更平滑抑制跳变
+LASER_ROI_SIZE      = 81         # v4.16: 61→81, 扩大ROI容忍帧间位移
+LASER_TRACK_MAX_D   = 60         # v4.16: 80→60, 收紧最近邻跟踪阈值, 减少跳候选
 
 # 矩形边框 (CHN1 RGB565 800x480) — 2025电赛E题靶子边框
 # v4.1: 外轮廓用 find_rects 边缘检测, RECT_LAB 仅用于 ROI 内白色边框厚度估算
@@ -125,14 +126,14 @@ def detect_laser(laser_img, prev_x, prev_y, locked):
         if rw >= 10 and rh >= 10:
             roi = (rx, ry, rw, rh)
             search_mode = "roi"
-            blobs = laser_img.find_blobs(RED_LASER_LAB_MULTI, False, roi=roi,
+            blobs = laser_img.find_blobs(RED_LASER_LAB_MERGED, False, roi=roi,
                 x_stride=1, y_stride=1, pixels_threshold=LASER_MIN_PX,
                 merge=True, margin=True)
     
-    # --- ROI 未命中 → 全局多阈值搜索 ---
+    # --- ROI 未命中 → 全局合并阈值搜索 ---
     if not blobs:
         search_mode = "global"
-        blobs = laser_img.find_blobs(RED_LASER_LAB_MULTI, False,
+        blobs = laser_img.find_blobs(RED_LASER_LAB_MERGED, False,
             x_stride=2, y_stride=2, pixels_threshold=LASER_MIN_PX,
             merge=True, margin=True)
     
@@ -395,12 +396,12 @@ def run():
         prev_hit=False
         srv_y=0.0; srv_p=0.0; srv_st=0; srv_ok=False
 
-        # EMA (v3.2: 下限 0.22→0.30, 减少靶心追踪滞后)
+        # EMA (v4.16: 所有档位降低 5%, 靶心更稳; 小误差用最低 alpha 防抖动)
         def ema_alpha(e):
-            if e>120: return 0.55
-            elif e>40: return 0.40
-            elif e>10: return 0.35
-            else: return 0.30
+            if e>120: return 0.50
+            elif e>40: return 0.35
+            elif e>10: return 0.30
+            else: return 0.22
 
         tgt_x=tgt_y=0; tgt_init=False
 
@@ -441,13 +442,21 @@ def run():
                 rlx, rly, raw_det = detect_laser(laser_img, lx_s if l_lock else -1,
                                                   ly_s if l_lock else -1, l_lock)
 
-            # 时序确认 + 位置 EMA
+            # 时序确认 + 位置 EMA + 帧间速率限制
             if raw_det:
                 l_hit_cnt  = min(l_hit_cnt + 1, 32)
                 l_miss_cnt = 0
                 if not l_lock and l_hit_cnt == 1:
                     lx_s, ly_s = rlx, rly
                 else:
+                    # v4.16: 帧间速率限制 — 防止多阈值近距离跳候选导致位置突变
+                    max_jump = 50  # 单帧最大允许位移 (px)
+                    dx = rlx - lx_s; dy = rly - ly_s
+                    d2 = dx*dx + dy*dy
+                    if d2 > max_jump * max_jump:
+                        scale = max_jump / math.sqrt(d2)
+                        rlx = int(lx_s + dx * scale)
+                        rly = int(ly_s + dy * scale)
                     lx_s = int(lx_s*(1-LASER_POS_ALPHA) + rlx*LASER_POS_ALPHA)
                     ly_s = int(ly_s*(1-LASER_POS_ALPHA) + rly*LASER_POS_ALPHA)
                 if l_hit_cnt >= LASER_LOCK_FRAMES:
@@ -582,11 +591,18 @@ def run():
                 target_x = target_y = 0
                 target_valid = False; target_from = "LOST"
 
-            # EMA 平滑靶心
+            # EMA 平滑靶心 (v4.16: 加帧间速率限制, 防 YOLO 框跳动)
             if target_valid:
                 if not tgt_init:
                     tgt_x=target_x; tgt_y=target_y; tgt_init=True
                 else:
+                    # 速率限制: 单帧靶心位移不超过 120px (防 YOLO 跳框)
+                    dx = target_x - tgt_x; dy = target_y - tgt_y
+                    max_jump = 120
+                    if dx*dx + dy*dy > max_jump * max_jump:
+                        scale = max_jump / math.sqrt(dx*dx + dy*dy)
+                        target_x = int(tgt_x + dx * scale)
+                        target_y = int(tgt_y + dy * scale)
                     a=ema_alpha(max(abs(target_x-tgt_x), abs(target_y-tgt_y)))
                     tgt_x=int(tgt_x*(1-a)+target_x*a)
                     tgt_y=int(tgt_y*(1-a)+target_y*a)
