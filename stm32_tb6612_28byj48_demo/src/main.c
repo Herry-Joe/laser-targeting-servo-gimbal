@@ -77,6 +77,7 @@ typedef enum {
     GIMBAL_DANCE   = 4,   /* 舞蹈模式！云台蹦迪 */
     GIMBAL_AUTO    = 5,   /* K230 自动打靶模式 */
     GIMBAL_POSCTRL = 6,   /* 串口位置闭环控制模式 (默认) */
+    GIMBAL_TRACE   = 7,   /* 矩形循迹测试模式 */
 } GimbalMode;
 
 static GimbalMode    g_gimbal_mode  = GIMBAL_POSCTRL;  /* 上电默认位置闭环, 串口调参 */
@@ -415,6 +416,8 @@ static int32_t PosCtrl_AngleToSteps(float angle);
 static float   PosCtrl_StepsToAngle(int32_t steps);
 static void PosCtrl_BacklashComp(StepperMotor *motor, int32_t *target,
                                   Direction *last_dir, int32_t backlash_steps);
+static void Trace_Init(int32_t half_size);
+static void Trace_Update(void);
 
 /* 目标位置 (步), 可串口/上位机设置 */
 static int32_t g_pos_target_pan  = 0;
@@ -423,6 +426,14 @@ static int32_t g_pos_target_tilt = 0;
 /* 输出 EMA 滤波, 让速度变化更平滑 */
 static float g_pos_out_filt_pan  = 0.0f;
 static float g_pos_out_filt_tilt = 0.0f;
+
+/* ---- 矩形循迹测试 (GIMBAL_TRACE) ---- */
+#define TRACE_SIZE_DEFAULT  300    /* 默认矩形半宽(步) ≈ ±26° */
+#define TRACE_DWELL_MS      200    /* 每个角停留时间(ms) */
+static uint8_t  g_trace_active = 0;      /* 循迹进行中 */
+static uint8_t  g_trace_corner = 0;      /* 当前目标角 (0~3) */
+static int32_t  g_trace_corners[4][2];   /* 4 个角 [Pan][Tilt] */
+static uint32_t g_trace_last_ms = 0;     /* 到角时间戳 */
 
 /* 丢步检测: 误差超过阈值且长时间不收敛则报警 */
 #define POS_LOSTSTEP_THRESH 2000   /* 2000步≈176°, 连续超过认为严重丢步/限位异常 */
@@ -780,12 +791,10 @@ static void NVIC_Config(void)
 int _write(int fd, char *ptr, int len)
 {
     (void)fd;
-    /* 调试输出仅走 USART1 (ST-Link/调试串口).
-     * 蓝牙(USART2, 9600) 与 K230(USART3) 各有独立发送通道
-     * (CmdReply / K230_SendStatus / BT_SendReport), 不再经 printf 扇出,
-     * 避免: (1) 9600 蓝牙阻塞主循环 (调试刷屏→抖动);
-     *       (2) 调试文本灌入 K230 接收缓冲, 顶掉状态回传帧. */
-    HAL_UART_Transmit(&huart1, (uint8_t *)ptr, (uint16_t)len, HAL_MAX_DELAY);
+    /* 调试输出走 USART1 (CH340), 非阻塞 10ms 超时.
+     * 之前用 HAL_MAX_DELAY: UART TX 卡住 → 整个系统死锁 → CH340 无输出.
+     * 超时则丢弃数据, 绝不阻塞主循环. */
+    HAL_UART_Transmit(&huart1, (uint8_t *)ptr, (uint16_t)len, 10);
     return len;
 }
 
@@ -925,6 +934,22 @@ static void Serial_Execute(void)
         } else {
             CmdReply("# OK Pan=%ld步 Tilt=%ld步\r\n", (long)g_backlash_pan, (long)g_backlash_tilt);
         }
+        return;
+    }
+    /* ---- 矩形循迹测试命令 ---- */
+    if (strncmp(p, "trace", 5) == 0 || strncmp(p, "TRACE", 5) == 0) {
+        int size = TRACE_SIZE_DEFAULT;
+        sscanf(p + 5, "%d", &size);
+        Trace_Init(size);
+        CmdReply("# OK 矩形循迹 ±%d步 (4角)\r\n", size);
+        return;
+    }
+    if (strncmp(p, "stop", 4) == 0 || strncmp(p, "STOP", 4) == 0) {
+        g_trace_active = 0;
+        Stepper_Stop(&g_motor_pan);
+        Stepper_Stop(&g_motor_tilt);
+        g_gimbal_mode = GIMBAL_POSCTRL;
+        CmdReply("# OK 停止\r\n");
         return;
     }
 
@@ -1218,7 +1243,67 @@ static void PosCtrl_SendTelemetry(void)
     }
 }
 
-/* ========================== K230 自动打靶控制 ========================== */
+/* ========================== 矩形循迹测试模式 ========================== */
+
+static void Trace_Init(int32_t half_size)
+{
+    if (half_size < 50)  half_size = 50;
+    if (half_size > 2048) half_size = 2048;
+
+    int32_t cx = g_motor_pan.pos_steps;
+    int32_t cy = g_motor_tilt.pos_steps;
+
+    /* 4 个角: 以当前位置为中心, 逆时针绕矩形 */
+    g_trace_corners[0][0] = cx - half_size;  g_trace_corners[0][1] = cy - half_size;
+    g_trace_corners[1][0] = cx + half_size;  g_trace_corners[1][1] = cy - half_size;
+    g_trace_corners[2][0] = cx + half_size;  g_trace_corners[2][1] = cy + half_size;
+    g_trace_corners[3][0] = cx - half_size;  g_trace_corners[3][1] = cy + half_size;
+
+    g_trace_corner   = 0;
+    g_trace_active   = 1;
+    g_trace_last_ms  = HAL_GetTick();
+    g_gimbal_mode    = GIMBAL_TRACE;
+
+    /* 设置第一个角为位置闭环目标 */
+    g_pos_target_pan  = g_trace_corners[0][0];
+    g_pos_target_tilt = g_trace_corners[0][1];
+    PosPID_Reset(&g_pos_pid_pan);
+    PosPID_Reset(&g_pos_pid_tilt);
+
+    printf("[TRACE] 启动矩形循迹 ±%ld步 (当前角%d)\r\n",
+           (long)half_size, g_trace_corner);
+}
+
+static void Trace_Update(void)
+{
+    if (!g_trace_active || g_gimbal_mode != GIMBAL_TRACE) {
+        g_trace_active = 0;
+        return;
+    }
+
+    /* 两个轴都到达当前角附近(死区5步) 且 停留足够久 → 切下一角 */
+    int32_t dx = g_trace_corners[g_trace_corner][0] - g_motor_pan.pos_steps;
+    int32_t dy = g_trace_corners[g_trace_corner][1] - g_motor_tilt.pos_steps;
+    uint32_t now = HAL_GetTick();
+
+    if (abs(dx) <= 5 && abs(dy) <= 5) {
+        if (now - g_trace_last_ms >= TRACE_DWELL_MS) {
+            /* 到达! 切下一角 */
+            g_trace_corner = (g_trace_corner + 1) % 4;
+            g_pos_target_pan  = g_trace_corners[g_trace_corner][0];
+            g_pos_target_tilt = g_trace_corners[g_trace_corner][1];
+            g_trace_last_ms = now;
+            printf("[TRACE] 角%d 目标(%ld,%ld)\r\n",
+                   g_trace_corner,
+                   (long)g_pos_target_pan, (long)g_pos_target_tilt);
+        }
+    } else {
+        g_trace_last_ms = now;  /* 没到就刷新计时 */
+    }
+
+    /* 更新位置闭环控制（双轴同时逼近当前角） */
+    PosCtrl_Update();
+}
 
 /**
  * @brief 向 K230 回传云台状态帧
@@ -1383,6 +1468,9 @@ static void K230_ProcessFrame(void)
         return;
     }
 
+    /* 循迹测试模式: 忽略 K230 坐标, 不切 AUTO */
+    if (g_gimbal_mode == GIMBAL_TRACE) return;
+
     /* 记录最后有效帧时间 */
     g_k230_last_valid = HAL_GetTick();
 
@@ -1469,7 +1557,7 @@ static void Gimbal_KeyScan(void)
         Stepper_Stop(&g_motor_pan);
         Stepper_Stop(&g_motor_tilt);
 
-        g_gimbal_mode = (GimbalMode)((g_gimbal_mode + 1) % 7);
+        g_gimbal_mode = (GimbalMode)((g_gimbal_mode + 1) % 8);
 
         switch (g_gimbal_mode) {
             case GIMBAL_PAN:
@@ -1510,7 +1598,14 @@ static void Gimbal_KeyScan(void)
                 printf("  x<角度> y<角度> 设置目标\r\n");
                 printf("  pid <p|t> <kp|ki|kd> <值> 调PID\r\n");
                 printf("  z 归零  k 切K230  m 切回位置环\r\n");
-                printf("  backlash <p|t> <步数> 调回程差\r\n");
+                printf("  trace <大小> 矩形循迹测试 (默认300步≈±26°)\r\n");
+                printf("  stop 停止  backlash <p|t> <步数> 调回程差\r\n");
+                break;
+            case GIMBAL_TRACE:
+                printf("\r\n[云台] → 矩形循迹测试\r\n");
+                printf("  trace <大小> 启动 (当前: %s)\r\n",
+                       g_trace_active ? "运行中" : "已停止");
+                printf("  stop 停止, 回到位置闭环\r\n");
                 break;
         }
         return;
@@ -1946,6 +2041,12 @@ int main(void)
         /* v5.1: 位置闭环模式 (默认) */
         if (g_gimbal_mode == GIMBAL_POSCTRL) {
             PosCtrl_Update();
+            PosCtrl_SendTelemetry();
+        }
+
+        /* 矩形循迹测试模式 */
+        if (g_gimbal_mode == GIMBAL_TRACE) {
+            Trace_Update();
             PosCtrl_SendTelemetry();
         }
 
