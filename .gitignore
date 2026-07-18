@@ -1,0 +1,26 @@
+# PlatformIO build
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# VS Code
+.vscode/
+
+# AI workspace
+.workbuddy/
+
+# Python
+__pycache__/
+*.pyc
+
+# Build artifacts
+*.o
+*.d
+*.elf
+*.bin
+firmware.elf
+firmware.bin
+
+# OS
+.DS_Store
+Thumbs.db

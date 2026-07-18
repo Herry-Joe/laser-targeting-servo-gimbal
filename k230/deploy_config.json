@@ -1,0 +1,17 @@
+{
+    "kmodel_path": "best_AnchorBaseDet_can2_10_s_20250730105226.kmodel",
+    "categories": ["yuan"],
+    "confidence_threshold": 0.5,
+    "nms_threshold": 0.5,
+    "img_size": [320, 320],
+    "num_classes": 1,
+    "nms_option": false,
+    "model_type": "AnchorBaseDet",
+    "anchors": [
+        [49, 47, 54, 53, 64, 61],
+        [60, 69, 74, 71, 89, 90],
+        [109, 88, 114, 109, 132, 132]
+    ],
+    "mean": [0.485, 0.456, 0.406],
+    "std": [0.229, 0.224, 0.225]
+}

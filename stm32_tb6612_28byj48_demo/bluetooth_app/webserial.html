@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>云台调参上位机 · 28BYJ-48</title>
+<style>
+  :root {
+    --bg: #0a0e1a; --card: #151b2e; --accent: #00e5ff; --accent2: #b14bff;
+    --ok: #00ff88; --warn: #ffd93d; --err: #ff4d6d; --text: #e8edf5; --muted: #8a94a8;
+    --btn-bg: rgba(0,229,255,0.08); --btn-border: rgba(0,229,255,0.2);
+    --ch1: #00e5ff; --ch2: #ff4d6d; --ch3: #00ff88; --ch4: #ffd93d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    padding: 16px 24px; min-width: 880px;
+  }
+  .app { display: flex; gap: 16px; align-items: flex-start; }
+  .left { width: 360px; flex-shrink: 0; }
+  .right { flex: 1; min-width: 0; }
+  h1 { font-size: 17px; margin: 0 0 12px; letter-spacing: 1px; }
+  h1 span { background: linear-gradient(90deg,var(--accent),var(--accent2));
+    -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .card { background: var(--card); border-radius: 12px; padding: 12px; margin-bottom: 10px;
+    border: 1px solid rgba(255,255,255,0.05); box-shadow: 0 3px 16px rgba(0,0,0,0.3); }
+  .row { display: flex; gap: 6px; align-items: center; }
+  .row.wrap { flex-wrap: wrap; }
+  .btn {
+    background: var(--btn-bg); border: 1px solid var(--btn-border);
+    color: var(--text); border-radius: 8px; padding: 8px 12px;
+    font-size: 13px; font-weight: 600; cursor: pointer;
+    transition: transform .06s; text-align: center; white-space: nowrap;
+  }
+  .btn:active { transform: scale(0.93); }
+  .btn.primary { background: linear-gradient(135deg,var(--accent),var(--accent2)); border: none; color: #061018; }
+  .btn.danger { border-color: var(--err); color: var(--err); }
+  .btn.sm { padding: 5px 8px; font-size: 11px; }
+  .btn.toggle-on { border-color: var(--accent); background: rgba(0,229,255,0.15); }
+  .btn-group { display: flex; gap: 3px; }
+
+  .status { display: flex; align-items: center; gap: 8px 16px; font-size: 13px; flex-wrap: wrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--err);
+    display: inline-block; flex-shrink: 0; box-shadow: 0 0 4px var(--err); }
+  .dot.on { background: var(--ok); box-shadow: 0 0 4px var(--ok); }
+  .port-info { font-size: 11px; color: var(--muted); }
+  select { background: #060a14; border: 1px solid rgba(255,255,255,0.08);
+    color: var(--text); border-radius: 5px; padding: 3px 6px; font-size: 12px; }
+  input[type=range] { accent-color: var(--accent); height: 4px; flex: 1; }
+  .speed-val { font-variant-numeric: tabular-nums; min-width: 56px;
+    text-align: right; color: var(--accent); font-weight: 600; font-size: 13px; }
+  .section { font-size: 11px; color: var(--muted); margin: 0 0 6px 2px;
+    font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  .badge { background: rgba(0,229,255,0.12); color: var(--accent);
+    padding: 1px 6px; border-radius: 6px; font-size: 10px; }
+  .hint { font-size: 10px; color: var(--muted); margin-top: 4px; line-height: 1.5; }
+
+  /* 追踪面板 */
+  .tg { display: grid; grid-template-columns: auto 1fr auto 1fr; gap: 2px 8px; font-size: 12px;
+    font-family: 'Cascadia Code','Fira Code',monospace; }
+  .tg .l { color: var(--muted); }
+  .tg .v { text-align: right; font-weight: 600; }
+  .tg .v.e { color: var(--err); } .tg .v.o { color: var(--ok); }
+  .tg .v.h { color: var(--warn); } .tg .v.c { color: var(--accent); }
+
+  /* PID 曲线 */
+  .chart-wrap { position: relative; }
+  #pidChart { width: 100%; height: 210px; display: block; border-radius: 6px; background: #060a14; }
+  .chart-legend { display: flex; gap: 12px; font-size: 11px; margin-top: 6px; flex-wrap: wrap; }
+  .chart-legend span { display: flex; align-items: center; gap: 4px; }
+  .legend-dot { width: 10px; height: 3px; border-radius: 2px; display: inline-block; }
+  .axis-note { font-size: 10px; color: var(--muted); margin-top: 2px; }
+
+  /* 终端 */
+  .term { background: #060a14; border-radius: 8px; padding: 6px; height: 150px;
+    overflow-y: auto; font-family: monospace; font-size: 11px; line-height: 1.5;
+    white-space: pre-wrap; margin-top: 6px; }
+  .term::-webkit-scrollbar { width: 3px; }
+  .term::-webkit-scrollbar-thumb { background: var(--card); border-radius: 2px; }
+  .cmd-row { display: flex; gap: 4px; margin-top: 6px; }
+  .cmd-row input { flex: 1; background: #060a14; border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 6px; padding: 0 10px; color: var(--text); font-family: monospace;
+    font-size: 12px; outline: none; }
+  .cmd-row input:focus { border-color: var(--accent); }
+
+  /* PID 调参 */
+  .axis-block { background: rgba(255,255,255,0.02); border-radius: 8px; padding: 8px; margin-bottom: 8px; }
+  .axis-title { font-size: 12px; font-weight: 700; margin-bottom: 6px; color: var(--accent); }
+  .axis-title.tilt { color: var(--ch2); }
+  .tune-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  .tune-row .lab { width: 26px; font-size: 11px; color: var(--muted); }
+  .tune-row .val { width: 64px; text-align: right; font-variant-numeric: tabular-nums;
+    font-size: 12px; color: var(--ok); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<h1>🎯 <span>云台调参上位机</span> · 28BYJ-48 / K230 打靶</h1>
+
+<div class="app">
+
+<!-- ====== 左列：连接 + 手动控制 + PID 调参 ====== -->
+<div class="left">
+
+  <!-- 连接 -->
+  <div class="card">
+    <div class="status">
+      <div class="dot" id="dot"></div>
+      <span id="statusText">未连接</span>
+      <span class="port-info" id="portInfo"></span>
+    </div>
+    <div class="row" style="margin-top:6px;gap:4px">
+      <select id="baudSelect" style="width:96px">
+        <option value="9600" selected>9600</option>
+        <option value="19200">19200</option>
+        <option value="38400">38400</option>
+        <option value="57600">57600</option>
+        <option value="115200">115200</option>
+      </select>
+      <button class="btn primary" id="connectBtn">连接串口</button>
+      <button class="btn danger" id="disconnectBtn" style="display:none">断开</button>
+    </div>
+    <div class="hint">CH340 接 STM32 的 <b>USART2(蓝牙口)</b> @9600 — K230 遥测帧由此输出，曲线/调参才有效；若接 USART1(调试口 115200) 只能收发命令、看不到曲线。</div>
+  </div>
+
+  <!-- 手动控制 -->
+  <div class="card">
+    <div class="section">🎮 云台手动控制 <span class="badge">切串口模式</span></div>
+    <div class="row" style="gap:4px;margin-bottom:6px">
+      <button class="btn sm toggle-on" id="axisPan">水平 Pan</button>
+      <button class="btn sm" id="axisTilt">俯仰 Tilt</button>
+    </div>
+    <div class="row" style="margin-bottom:6px">
+      <button class="btn sm" data-cmd="c">▶ 正转</button>
+      <button class="btn sm" data-cmd="a">◀ 反转</button>
+      <button class="btn sm" data-cmd="s">⏹ 停止</button>
+    </div>
+    <div class="row wrap" style="gap:3px">
+      <button class="btn sm" data-cmd="+100">+100步</button>
+      <button class="btn sm" data-cmd="-100">-100步</button>
+      <button class="btn sm" data-cmd="r45">转45°</button>
+      <button class="btn sm" data-cmd="r90">转90°</button>
+      <button class="btn sm" data-cmd="p w90">扫描±90</button>
+      <button class="btn sm" data-cmd="h">半步</button>
+      <button class="btn sm" data-cmd="f">全步</button>
+      <button class="btn sm" data-cmd="i">反转Pan</button>
+      <button class="btn sm" data-cmd="I">反转Tilt</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <span style="font-size:11px;color:var(--muted)">速度</span>
+      <input type="range" id="speed" min="1300" max="10000" value="3000" step="100">
+      <span class="speed-val" id="speedVal">3000µs</span>
+    </div>
+    <div class="hint">点命令会切到“串口模式”，打断自动打靶；K230 再发帧即自动恢复 AUTO。</div>
+  </div>
+
+  <!-- PID 实时调参 -->
+  <div class="card">
+    <div class="section">🎛 实时 PID 调参
+      <button class="btn sm primary" id="readPidBtn" style="margin-left:auto">读取当前</button>
+    </div>
+
+    <div class="axis-block">
+      <div class="axis-title">Pan 水平轴</div>
+      <div class="tune-row"><span class="lab">增益Kp</span><input type="range" data-axis="p" data-param="kp" min="0.1" max="3" step="0.05" value="1.0"><span class="val" id="kp_p_v">1.000</span></div>
+      <div class="tune-row"><span class="lab">减速区Ki</span><input type="range" data-axis="p" data-param="ki" min="10" max="120" step="1" value="35"><span class="val" id="ki_p_v">35</span></div>
+      <div class="tune-row"><span class="lab">阻尼Kd</span><input type="range" data-axis="p" data-param="kd" min="0" max="0.01" step="0.0005" value="0"><span class="val" id="kd_p_v">0.0000</span></div>
+    </div>
+
+    <div class="axis-block">
+      <div class="axis-title tilt">Tilt 俯仰轴</div>
+      <div class="tune-row"><span class="lab">增益Kp</span><input type="range" data-axis="t" data-param="kp" min="0.1" max="3" step="0.05" value="1.0"><span class="val" id="kp_t_v">1.000</span></div>
+      <div class="tune-row"><span class="lab">减速区Ki</span><input type="range" data-axis="t" data-param="ki" min="10" max="120" step="1" value="25"><span class="val" id="ki_t_v">25</span></div>
+      <div class="tune-row"><span class="lab">阻尼Kd</span><input type="range" data-axis="t" data-param="kd" min="0" max="0.01" step="0.0005" value="0"><span class="val" id="kd_t_v">0.0000</span></div>
+    </div>
+    <div class="hint">拖动滑块即实时下发 <code>g &lt;轴&gt; &lt;参数&gt; &lt;值&gt;</code>，断电不保存。<b>Kp=速度增益</b>(追得慢就调大)；<b>Ki=减速区(px)</b>(仍过冲靶心就调大，让接近更柔和)；<b>Kd=阻尼</b>(0=关，过冲严重时加 0.002~0.005)。</div>
+  </div>
+
+</div>
+
+<!-- ====== 右列：追踪状态 + PID 曲线 + 串口监视 ====== -->
+<div class="right">
+
+  <!-- K230 追踪状态 -->
+  <div class="card" id="trackCard" style="display:none">
+    <div class="section">🎯 追踪状态 <span class="badge" id="trackMode">--</span></div>
+    <div class="tg">
+      <span class="l">Pan 误差</span><span class="v c" id="tPanErr">--</span>
+      <span class="l">Tilt 误差</span><span class="v c" id="tTiltErr">--</span>
+      <span class="l">PID_P 输出</span><span class="v" id="tPidP">--</span>
+      <span class="l">PID_T 输出</span><span class="v" id="tPidT">--</span>
+      <span class="l">命中</span><span class="v" id="tHit">--</span>
+      <span class="l">模式</span><span class="v" id="tMode">--</span>
+    </div>
+  </div>
+
+  <!-- PID 实时曲线 -->
+  <div class="card">
+    <div class="section">
+      📈 PID 实时曲线
+      <span class="badge" id="chartPoints">0 点</span>
+      <label style="margin-left:auto;font-size:11px;color:var(--muted);display:flex;align-items:center;gap:4px">
+        <input type="checkbox" id="pauseChart"> 暂停
+        <button class="btn sm" id="clearChart" style="margin-left:6px">清零</button>
+      </label>
+    </div>
+    <div class="chart-wrap"><canvas id="pidChart"></canvas></div>
+    <div class="chart-legend">
+      <span><span class="legend-dot" style="background:var(--ch1)"></span> Pan误差</span>
+      <span><span class="legend-dot" style="background:var(--ch2)"></span> Tilt误差</span>
+      <span><span class="legend-dot" style="background:var(--ch3)"></span> PID_P</span>
+      <span><span class="legend-dot" style="background:var(--ch4)"></span> PID_T</span>
+    </div>
+    <div class="axis-note">左轴 = 误差(px，青/红) · 右轴 = PID输出(±1，绿/黄)</div>
+  </div>
+
+  <!-- 串口监视 -->
+  <div class="card">
+    <div class="section">
+      串口监视 <span class="badge" id="echoCount">0</span>
+      <span style="margin-left:auto;font-size:10px;color:var(--muted);cursor:pointer" id="clearBtn">清空</span>
+    </div>
+    <div class="term" id="term"></div>
+    <div class="cmd-row">
+      <input type="text" id="cmdInput" placeholder="自定义命令… 例: P / ? / g p kp 0.02" spellcheck="false">
+      <button class="btn sm primary" id="sendCmdBtn">发送</button>
+    </div>
+  </div>
+
+</div>
+</div>
+
+<script>
+/* ===================== PID 曲线引擎 (双轴: 误差px / PID输出±1) ===================== */
+const CHART_MAX = 300;
+const chartData = { panErr: [], tiltErr: [], pidP: [], pidT: [] };
+let chartPaused = false;
+const canvas = document.getElementById('pidChart');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width * devicePixelRatio;
+  canvas.height = 210 * devicePixelRatio;
+  canvas.style.width = rect.width + 'px';
+  canvas.style.height = '210px';
+  ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+function pushChartData(panErr, tiltErr, pidP, pidT) {
+  if (chartPaused) return;
+  const push = (arr, v) => {
+    if (v === undefined || v === null || isNaN(v)) v = 0;
+    arr.push(v); if (arr.length > CHART_MAX) arr.shift();
+  };
+  push(chartData.panErr, panErr);
+  push(chartData.tiltErr, tiltErr);
+  push(chartData.pidP, pidP);
+  push(chartData.pidT, pidT);
+  document.getElementById('chartPoints').textContent = chartData.panErr.length + ' 点';
+  drawChart();
+}
+
+function drawChart() {
+  const w = canvas.width / devicePixelRatio, h = 210;
+  const pad = { t: 14, b: 18, l: 40, r: 40 };
+  const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#060a14'; ctx.fillRect(0, 0, w, h);
+
+  const n = chartData.panErr.length;
+  if (n < 2) {
+    ctx.fillStyle = '#4a5568'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('等待 K230 遥测…', w/2, h/2); return;
+  }
+
+  // 误差量程(左轴)
+  let errMax = 5;
+  for (const v of chartData.panErr) errMax = Math.max(errMax, Math.abs(v));
+  for (const v of chartData.tiltErr) errMax = Math.max(errMax, Math.abs(v));
+  const mag = Math.pow(10, Math.floor(Math.log10(errMax)));
+  errMax = Math.ceil(errMax / mag) * mag;
+  const pidMax = 1.0; // PID 输出限幅 ±1
+
+  const errY = v => pad.t + ((v + errMax) / (2 * errMax)) * ph;
+  const pidY = v => pad.t + ((v + pidMax) / (2 * pidMax)) * ph;
+
+  // 网格 + 双轴标尺
+  const gridLines = 4;
+  ctx.font = '9px monospace';
+  for (let i = 0; i <= gridLines; i++) {
+    const y = pad.t + (i / gridLines) * ph;
+    ctx.strokeStyle = (i === gridLines/2) ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y); ctx.stroke();
+    // 左轴(误差)
+    const ev = errMax - (i / gridLines) * (2 * errMax);
+    ctx.fillStyle = '#4a5568'; ctx.textAlign = 'right';
+    ctx.fillText(Math.round(ev), pad.l - 4, y + 3);
+    // 右轴(PID)
+    const pv = pidMax - (i / gridLines) * (2 * pidMax);
+    ctx.textAlign = 'left';
+    ctx.fillText(pv.toFixed(1), w - pad.r + 4, y + 3);
+  }
+  // 零位标线
+  const zeroY = pad.t + ph / 2;
+  ctx.strokeStyle = 'rgba(255,255,255,0.10)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(pad.l, zeroY); ctx.lineTo(w - pad.r, zeroY); ctx.stroke();
+
+  // 数据线
+  const series = [
+    { key: 'panErr', color: '#00e5ff', y: errY },
+    { key: 'tiltErr', color: '#ff4d6d', y: errY },
+    { key: 'pidP', color: '#00ff88', y: pidY },
+    { key: 'pidT', color: '#ffd93d', y: pidY },
+  ];
+  for (const s of series) {
+    const data = chartData[s.key];
+    if (data.length < 2) continue;
+    const step = pw / (data.length - 1);
+    ctx.strokeStyle = s.color; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < data.length; i++) {
+      const x = pad.l + i * step, y = s.y(data[i]);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    // 末端标签
+    const last = data[data.length - 1];
+    const lx = pad.l + (data.length - 1) * step;
+    const ly = s.y(last);
+    ctx.fillStyle = s.color; ctx.font = '9px monospace'; ctx.textAlign = 'left';
+    const txt = s.key.endsWith('Err') ? last.toFixed(0) : last.toFixed(2);
+    ctx.fillText(txt, Math.min(lx + 4, w - pad.r - 36), Math.max(ly - 4, pad.t + 9));
+  }
+}
+
+/* ===================== Web Serial (CH340 鲁棒连接) ===================== */
+let port = null, reader = null, keepReading = false;
+const enc = new TextEncoder(), dec = new TextDecoder();
+const $ = id => document.getElementById(id);
+const dot = $('dot'), statusText = $('statusText'), portInfo = $('portInfo');
+const connectBtn = $('connectBtn'), disconnectBtn = $('disconnectBtn'), baudSelect = $('baudSelect');
+const term = $('term'), cmdInput = $('cmdInput'), echoCount = $('echoCount');
+const speed = $('speed'), speedVal = $('speedVal');
+let lineCount = 0, lastPidAxis = '';
+
+function log(msg, color) {
+  const line = document.createElement('div');
+  if (msg.startsWith('# OK')) line.innerHTML = '<span style="color:var(--ok)">'+esc(msg)+'</span>';
+  else if (msg.startsWith('# ERR')) line.innerHTML = '<span style="color:var(--err)">'+esc(msg)+'</span>';
+  else if (msg.startsWith('»')) line.innerHTML = '<span style="color:var(--accent)">'+esc(msg)+'</span>';
+  else if (msg.startsWith('K230,')) line.innerHTML = '<span style="color:var(--warn)">'+esc(msg)+'</span>';
+  else if (color) { line.style.color = color; line.textContent = msg; }
+  else line.textContent = msg;
+  term.appendChild(line); term.scrollTop = term.scrollHeight;
+  lineCount++; echoCount.textContent = lineCount;
+  while (term.childNodes.length > 200) { term.removeChild(term.firstChild); lineCount--; }
+}
+function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function setConnected(on) {
+  dot.classList.toggle('on', on); statusText.textContent = on ? '已连接' : '未连接';
+  connectBtn.style.display = on ? 'none' : 'block';
+  disconnectBtn.style.display = on ? 'block' : 'none';
+  baudSelect.disabled = on;
+}
+
+/* ---- K230 紧凑遥测解析 (K230,P:..,T:..,PP:..,PT:..,I:..,J:..,H:..,S:..) ---- */
+function parseReport(line) {
+  const m = {};
+  line.split(',').forEach(tok => { const i = tok.indexOf(':'); if (i > 0) m[tok.slice(0,i)] = tok.slice(i+1); });
+  const panErr = parseInt(m.P) || 0;
+  const tiltErr = parseInt(m.T) || 0;
+  const pidP = parseFloat(m.PP) || 0;
+  const pidT = parseFloat(m.PT) || 0;
+  const hit = m.H === '1';
+  const mode = m.S;
+
+  $('trackCard').style.display = 'block';
+  $('tPanErr').textContent = panErr + 'px';
+  $('tPanErr').className = 'v c' + (Math.abs(panErr) > 10 ? ' e' : '');
+  $('tTiltErr').textContent = tiltErr + 'px';
+  $('tTiltErr').className = 'v c' + (Math.abs(tiltErr) > 10 ? ' e' : '');
+  $('tPidP').textContent = pidP.toFixed(3);
+  $('tPidT').textContent = pidT.toFixed(3);
+  $('tHit').textContent = hit ? 'YES' : 'no';
+  $('tHit').className = 'v' + (hit ? ' h' : '');
+  $('tMode').textContent = mode === 'A' ? 'AUTO' : 'MAN';
+
+  pushChartData(panErr, tiltErr, pidP, pidT);
+}
+
+/* ---- P 命令回显解析 (读取当前 PID 增益填入滑块) ---- */
+function parsePidReply(line) {
+  if (line.includes('Pan') && line.includes('PID')) lastPidAxis = 'p';
+  else if (line.includes('Tilt') && line.includes('PID')) lastPidAxis = 't';
+  const mm = line.match(/Kp=([\d.]+)\s+Ki=([\d.]+)\s+Kd=([\d.]+)/);
+  if (mm && lastPidAxis) {
+    setSlider(lastPidAxis, 'kp', parseFloat(mm[1]));
+    setSlider(lastPidAxis, 'ki', parseFloat(mm[2]));
+    setSlider(lastPidAxis, 'kd', parseFloat(mm[3]));
+  }
+}
+function setSlider(axis, param, val) {
+  const el = document.querySelector(`input[data-axis="${axis}"][data-param="${param}"]`);
+  if (!el) return;
+  el.value = val;
+  $(`${param}_${axis}_v`).textContent = val.toFixed(4);
+}
+
+async function connect() {
+  if (!('serial' in navigator)) { log('⚠ 浏览器不支持 Web Serial，请用 Chrome / Edge', '#ff4d6d'); return; }
+  if (port) { try { await disconnect(); } catch(_) {} }   // 已连则先清理, 保证可重连
+  try {
+    port = await navigator.serial.requestPort();
+    const info = port.getInfo();
+    portInfo.textContent = info.usbVendorId
+      ? `USB ${info.usbVendorId.toString(16)}:${info.usbProductId.toString(16)}` : '';
+    await port.open({ baudRate: parseInt(baudSelect.value, 10) });
+    keepReading = true;
+    log(`串口已打开 ✓ 波特率 ${baudSelect.value}`);
+    setConnected(true);
+    readLoop();
+  } catch (e) { log('连接失败: ' + e.message, '#ff4d6d'); port = null; }
+}
+
+async function readLoop() {
+  while (port && port.readable && keepReading) {
+    reader = port.readable.getReader();
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        handleData(value);
+      }
+    } catch (e) { if (keepReading) log('读错误: ' + e.message, '#ff4d6d'); }
+    finally { try { reader.releaseLock(); } catch(_) {} reader = null; }
+  }
+}
+
+function handleData(value) {
+  const str = dec.decode(value);
+  for (const raw of str.split('\n')) {
+    const l = raw.trim();
+    if (!l) continue;
+    log(l);
+    if (l.startsWith('K230,')) parseReport(l);
+    else parsePidReply(l);
+  }
+}
+
+async function send(cmd) {
+  if (!port || !port.writable) { log('⚠ 未连接', '#ff4d6d'); return; }
+  try {
+    const writer = port.writable.getWriter();
+    await writer.write(enc.encode(cmd + '\n')); writer.releaseLock();
+    log('» ' + cmd);
+  } catch (e) { log('发送失败: ' + e.message, '#ff4d6d'); }
+}
+
+async function disconnect() {
+  keepReading = false;
+  if (reader) { try { await reader.cancel(); } catch(_) {} }
+  // 关键: 必须等 reader 释放锁后再关端口, 否则 CH340 下次无法重连
+  let guard = 0;
+  while (reader && guard++ < 200) await new Promise(r => setTimeout(r, 10));
+  if (port) { try { await port.close(); } catch(_) {} port = null; }
+  setConnected(false); portInfo.textContent = ''; log('已断开');
+}
+
+// 物理断开(CH340 拔出)自动复位状态
+if ('serial' in navigator) {
+  navigator.serial.addEventListener('disconnect', async (e) => {
+    if (port && e.target === port) {
+      log('设备已物理断开 (CH340 拔出)', '#ff4d6d');
+      keepReading = false;
+      if (reader) { try { await reader.cancel(); } catch(_) {} }
+      let g = 0; while (reader && g++ < 200) await new Promise(r => setTimeout(r, 10));
+      try { if (port) await port.close(); } catch(_) {}
+      port = null; setConnected(false); portInfo.textContent = '';
+    }
+  });
+}
+
+/* ===================== 事件绑定 ===================== */
+connectBtn.onclick = connect;
+disconnectBtn.onclick = disconnect;
+document.querySelectorAll('[data-cmd]').forEach(b => { b.onclick = () => send(b.dataset.cmd); });
+$('clearBtn').onclick = () => { term.innerHTML = ''; lineCount = 0; echoCount.textContent = '0'; };
+$('sendCmdBtn').onclick = () => { const v = cmdInput.value.trim(); if (v) { send(v); cmdInput.value = ''; } };
+cmdInput.onkeydown = e => { if (e.key === 'Enter') { const v = cmdInput.value.trim(); if (v) { send(v); cmdInput.value = ''; } e.preventDefault(); } };
+
+speed.oninput = () => { speedVal.textContent = speed.value + 'µs'; };
+speed.onchange = () => { send('v' + speed.value); };
+
+$('axisPan').onclick = () => { send('p'); setActiveAxis('p'); };
+$('axisTilt').onclick = () => { send('t'); setActiveAxis('t'); };
+function setActiveAxis(a) {
+  $('axisPan').className = 'btn sm' + (a === 'p' ? ' toggle-on' : '');
+  $('axisTilt').className = 'btn sm' + (a === 't' ? ' toggle-on' : '');
+}
+
+// PID 调参滑块: 实时下发 g 命令
+document.querySelectorAll('.tune-row input[type=range]').forEach(s => {
+  const lab = $(`${s.dataset.param}_${s.dataset.axis}_v`);
+  s.addEventListener('input', () => {
+    const v = parseFloat(s.value);
+    lab.textContent = v.toFixed(4);
+    send(`g ${s.dataset.axis} ${s.dataset.param} ${v.toFixed(4)}`);
+  });
+});
+$('readPidBtn').onclick = () => { lastPidAxis = ''; send('P'); };  // 回显解析后填入滑块
+
+$('pauseChart').onchange = function () { chartPaused = this.checked; };
+$('clearChart').onclick = () => {
+  chartData.panErr.length = 0; chartData.tiltErr.length = 0;
+  chartData.pidP.length = 0; chartData.pidT.length = 0;
+  drawChart();
+};
+
+if (!('serial' in navigator)) {
+  log('⚠ 当前浏览器不支持 Web Serial，请用 Chrome / Edge 打开', '#ff4d6d');
+  connectBtn.disabled = true;
+}
+drawChart();
+</script>
+</body>
+</html>

@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>28BYJ-48 位置闭环调试台</title>
+  <style>
+    :root { --bg:#f7f8fa; --card:#fff; --text:#1f2937; --muted:#6b7280; --border:#e5e7eb; --blue:#2563eb; --red:#dc2626; --green:#16a34a; --amber:#f59e0b; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
+    header { padding: 16px 24px; background: var(--card); border-bottom: 1px solid var(--border); }
+    h1 { margin:0; font-size: 18px; }
+    .wrap { padding: 20px 24px; max-width: 1200px; margin: 0 auto; display: grid; gap: 18px; }
+    .card { background: var(--card); border-radius: 10px; border: 1px solid var(--border); padding: 18px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+    label { font-size: 13px; color: var(--muted); min-width: 60px; }
+    input[type="text"], input[type="number"], select { padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; }
+    button { padding: 8px 14px; border: none; border-radius: 6px; background: var(--blue); color: #fff; font-size: 14px; cursor: pointer; }
+    button:hover { opacity: .9; }
+    button:disabled { background: #9ca3af; cursor: not-allowed; }
+    button.ghost { background: var(--card); color: var(--text); border: 1px solid var(--border); }
+    .tune { display: grid; gap: 10px; }
+    .tune-row { display: flex; align-items: center; gap: 10px; }
+    .tune-row .lab { width: 60px; font-size: 13px; color: var(--muted); }
+    .tune-row input[type=range] { flex: 1; }
+    .tune-row .val { width: 70px; text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; }
+    .valbox { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    .valbox div { background: #f9fafb; border: 1px solid var(--border); border-radius: 6px; padding: 8px; text-align: center; }
+    .valbox .v { font-size: 18px; font-weight: 600; }
+    .valbox .k { font-size: 11px; color: var(--muted); margin-top: 4px; }
+    canvas { width: 100%; height: 220px; background: #f9fafb; border: 1px solid var(--border); border-radius: 6px; }
+    #term { width: 100%; height: 180px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: #111827; color: #e5e7eb; border-radius: 6px; padding: 10px; overflow: auto; white-space: pre-wrap; }
+    .send-row { display: flex; gap: 8px; margin-top: 10px; }
+    .send-row input { flex: 1; }
+    .status { font-size: 12px; color: var(--muted); }
+    .status span { color: var(--green); font-weight: 600; }
+    .status span.off { color: var(--red); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>28BYJ-48 双轴云台 · 位置闭环调试台</h1>
+  </header>
+  <div class="wrap">
+    <div class="card">
+      <div class="row">
+        <button id="btnConnect">连接串口 (CH340)</button>
+        <button id="btnDisconnect" class="ghost" disabled>断开</button>
+        <select id="baud">
+          <option value="115200" selected>115200</option>
+          <option value="9600">9600</option>
+        </select>
+        <span class="status">状态: <span id="connStatus" class="off">未连接</span></span>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="card">
+        <h3>目标位置</h3>
+        <div class="row">
+          <label>Pan(°)</label>
+          <input id="panTarget" type="number" value="0" step="5">
+          <button onclick="send('x' + document.getElementById('panTarget').value)">发送</button>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <label>Tilt(°)</label>
+          <input id="tiltTarget" type="number" value="0" step="5">
+          <button onclick="send('y' + document.getElementById('tiltTarget').value)">发送</button>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button onclick="send('z')">归零</button>
+          <button onclick="send('s')" class="ghost">停止</button>
+          <button onclick="send('m')" class="ghost">切回位置环</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Pan PID</h3>
+        <div class="tune">
+          <div class="tune-row"><span class="lab">Kp</span><input type="range" id="pPanKp" min="0.0001" max="0.005" step="0.0001" value="0.0006"><span class="val" id="pPanKpV">0.0006</span></div>
+          <div class="tune-row"><span class="lab">Ki</span><input type="range" id="pPanKi" min="0" max="0.0001" step="0.000005" value="0"><span class="val" id="pPanKiV">0.00000</span></div>
+          <div class="tune-row"><span class="lab">Kd</span><input type="range" id="pPanKd" min="0" max="0.001" step="0.00001" value="0.00005"><span class="val" id="pPanKdV">0.00005</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Tilt PID</h3>
+        <div class="tune">
+          <div class="tune-row"><span class="lab">Kp</span><input type="range" id="pTiltKp" min="0.0001" max="0.005" step="0.0001" value="0.0006"><span class="val" id="pTiltKpV">0.0006</span></div>
+          <div class="tune-row"><span class="lab">Ki</span><input type="range" id="pTiltKi" min="0" max="0.0001" step="0.000005" value="0"><span class="val" id="pTiltKiV">0.00000</span></div>
+          <div class="tune-row"><span class="lab">Kd</span><input type="range" id="pTiltKd" min="0" max="0.001" step="0.00001" value="0.00005"><span class="val" id="pTiltKdV">0.00005</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>实时数据</h3>
+        <div class="valbox">
+          <div><div class="v" id="vPanA">0.0</div><div class="k">Pan 角度°</div></div>
+          <div><div class="v" id="vPanE">0</div><div class="k">Pan 误差步</div></div>
+          <div><div class="v" id="vTiltA">0.0</div><div class="k">Tilt 角度°</div></div>
+          <div><div class="v" id="vTiltE">0</div><div class="k">Tilt 误差步</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>曲线</h3>
+      <canvas id="chart"></canvas>
+    </div>
+
+    <div class="card">
+      <h3>串口监视</h3>
+      <div id="term"></div>
+      <div class="send-row">
+        <input id="cmdLine" type="text" placeholder="输入命令, 回车发送" onkeydown="if(event.key==='Enter')sendLine()">
+        <button onclick="sendLine()">发送</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let port=null, reader=null, writer=null, keepReading=false;
+    const term=document.getElementById('term');
+    const chart=document.getElementById('chart');
+    const ctx=chart.getContext('2d');
+    const MAX=200;
+    const data={panA:[],panT:[],panE:[],tiltA:[],tiltT:[],tiltE:[]};
+
+    function push(arr,v){ arr.push(v); if(arr.length>MAX) arr.shift(); }
+    function log(s){ term.textContent+=s+'\n'; term.scrollTop=term.scrollHeight; }
+
+    function fmt6(v){ return Number(v).toFixed(6); }
+    function fmt1(v){ return Number(v).toFixed(1); }
+    function fmt0(v){ return Math.round(v); }
+
+    async function connect(){
+      if(!navigator.serial){ log('当前浏览器不支持 Web Serial, 请用 Chrome/Edge'); return; }
+      try{
+        port=await navigator.serial.requestPort({filters:[]});
+        await port.open({baudRate:parseInt(document.getElementById('baud').value)});
+        writer=await port.writable.getWriter();
+        log('串口已连接');
+        document.getElementById('connStatus').textContent='已连接'; document.getElementById('connStatus').className='';
+        document.getElementById('btnConnect').disabled=true; document.getElementById('btnDisconnect').disabled=false;
+        keepReading=true; readLoop();
+        port.addEventListener('disconnect', onDisconnect);
+      }catch(e){ log('连接失败: '+e.message); }
+    }
+
+    async function readLoop(){
+      const textDecoder=new TextDecoder();
+      reader=port.readable.getReader();
+      while(keepReading && reader){
+        try{
+          const {value,done}=await reader.read();
+          if(done || !keepReading) break;
+          if(value) parseChunk(textDecoder.decode(value,{stream:true}));
+        }catch(e){ if(e.name!=='AbortError') log('读错误: '+e.message); break; }
+      }
+      if(reader){ try{await reader.releaseLock();}catch{} reader=null; }
+    }
+
+    let rxBuf='';
+    function parseChunk(chunk){
+      rxBuf+=chunk;
+      let i;
+      while((i=rxBuf.indexOf('\n'))!==-1){
+        const line=rxBuf.slice(0,i).replace(/\r/g,''); rxBuf=rxBuf.slice(i+1);
+        if(line.startsWith('POS,')) parseTelemetry(line);
+        else log(line);
+      }
+    }
+
+    function parseTelemetry(line){
+      const p=line.split(','); if(p.length<9) return;
+      const panA=parseFloat(p[1]), panT=parseFloat(p[2]), panE=parseFloat(p[3]);
+      const tiltA=parseFloat(p[5]), tiltT=parseFloat(p[6]), tiltE=parseFloat(p[7]);
+      push(data.panA, panA); push(data.panT, panT); push(data.panE, panE);
+      push(data.tiltA, tiltA); push(data.tiltT, tiltT); push(data.tiltE, tiltE);
+      document.getElementById('vPanA').textContent=fmt1(panA);
+      document.getElementById('vPanE').textContent=fmt0(panE);
+      document.getElementById('vTiltA').textContent=fmt1(tiltA);
+      document.getElementById('vTiltE').textContent=fmt0(tiltE);
+      drawChart();
+    }
+
+    function drawChart(){
+      const w=chart.width=chart.clientWidth, h=chart.height=chart.clientHeight;
+      ctx.clearRect(0,0,w,h);
+      ctx.strokeStyle='#e5e7eb'; ctx.beginPath(); ctx.moveTo(0,h/2); ctx.lineTo(w,h/2); ctx.stroke();
+      const all=[...data.panE,...data.tiltE]; let max=0; all.forEach(v=>{ const a=Math.abs(v); if(a>max) max=a; });
+      if(max<10) max=10; const scaleY=(h/2-10)/max;
+      function draw(arr, color, dashed){
+        if(arr.length<2) return;
+        ctx.strokeStyle=color; ctx.setLineDash(dashed?[4,4]:[]); ctx.lineWidth=2; ctx.beginPath();
+        for(let i=0;i<arr.length;i++){
+          const x=i/(MAX-1)*w; const y=h/2 - arr[i]*scaleY; if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+        }
+        ctx.stroke(); ctx.setLineDash([]);
+      }
+      draw(data.panE, '#2563eb', false);
+      draw(data.tiltE, '#dc2626', false);
+      draw(data.panT, '#10b981', true);   /* 目标位置(角度) */
+      draw(data.tiltT, '#f59e0b', true);
+      ctx.fillStyle='#6b7280'; ctx.font='12px sans-serif'; ctx.fillText('误差±0', 6, h/2+14);
+      ctx.fillStyle='#2563eb'; ctx.fillText('Pan误差', 6, 14);
+      ctx.fillStyle='#dc2626'; ctx.fillText('Tilt误差', 56, 14);
+      ctx.fillStyle='#10b981'; ctx.fillText('Pan目标(虚)', 116, 14);
+      ctx.fillStyle='#f59e0b'; ctx.fillText('Tilt目标(虚)', 196, 14);
+    }
+
+    async function send(s){
+      if(!writer){ log('请先连接串口'); return; }
+      const data=(s+'\r\n'); const enc=new TextEncoder().encode(data);
+      await writer.write(enc);
+    }
+
+    function sendLine(){ const el=document.getElementById('cmdLine'); send(el.value); el.value=''; }
+
+    async function onDisconnect(){
+      keepReading=false; if(reader) await reader.cancel().catch(()=>{});
+      if(writer){ writer.releaseLock(); writer=null; }
+      try{ await port.close(); }catch{} port=null; reader=null;
+      document.getElementById('connStatus').textContent='未连接'; document.getElementById('connStatus').className='off';
+      document.getElementById('btnConnect').disabled=false; document.getElementById('btnDisconnect').disabled=true;
+      log('串口已断开');
+    }
+
+    async function disconnect(){
+      keepReading=false; if(reader) await reader.cancel().catch(()=>{});
+      if(writer){ writer.releaseLock(); writer=null; }
+      if(port){ try{await port.close();}catch{} port=null; }
+      document.getElementById('connStatus').textContent='未连接'; document.getElementById('connStatus').className='off';
+      document.getElementById('btnConnect').disabled=false; document.getElementById('btnDisconnect').disabled=true;
+      log('串口已断开');
+    }
+
+    document.getElementById('btnConnect').onclick=connect;
+    document.getElementById('btnDisconnect').onclick=disconnect;
+
+    /* PID 滑块 */
+    function bindSlider(id, axis, param, fmt){
+      const el=document.getElementById(id), disp=document.getElementById(id+'V');
+      el.oninput=()=>{ disp.textContent=fmt(el.value); };
+      el.onchange=()=>{ send('pid '+axis+' '+param+' '+el.value); };
+    }
+    bindSlider('pPanKp','p','kp',fmt6); bindSlider('pPanKi','p','ki',fmt6); bindSlider('pPanKd','p','kd',fmt6);
+    bindSlider('pTiltKp','t','kp',fmt6); bindSlider('pTiltKi','t','ki',fmt6); bindSlider('pTiltKd','t','kd',fmt6);
+  </script>
+</body>
+</html>

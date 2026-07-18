@@ -1,0 +1,21 @@
+# PlatformIO 编译产物
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# WorkBuddy AI 工作记忆
+.workbuddy/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# 编译产物 (本地 build 目录)
+build/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

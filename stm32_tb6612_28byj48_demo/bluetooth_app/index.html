@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>云台遥控 · 28BYJ-48</title>
+<style>
+  :root {
+    --bg: #0a0e1a;
+    --card: #151b2e;
+    --accent: #00e5ff;
+    --accent2: #b14bff;
+    --ok: #00ff88;
+    --warn: #ff4d6d;
+    --text: #e8edf5;
+    --muted: #8a94a8;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    padding: 14px; max-width: 480px; margin: 0 auto;
+    user-select: none;
+  }
+  h1 { font-size: 18px; margin: 4px 0 12px; text-align: center; letter-spacing: 1px; }
+  h1 span { background: linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .card {
+    background: var(--card); border-radius: 16px; padding: 14px;
+    margin-bottom: 14px; border: 1px solid rgba(255,255,255,0.05);
+    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+  }
+  .row { display: flex; gap: 8px; }
+  .row .btn { flex: 1; }
+  .btn {
+    background: linear-gradient(135deg, rgba(0,229,255,0.15), rgba(177,75,255,0.15));
+    border: 1px solid rgba(0,229,255,0.3); color: var(--text);
+    border-radius: 12px; padding: 14px 8px; font-size: 15px; font-weight: 600;
+    cursor: pointer; transition: transform .08s; touch-action: manipulation;
+  }
+  .btn:active { transform: scale(0.94); }
+  .btn.primary { background: linear-gradient(135deg, var(--accent), var(--accent2));
+    border: none; color: #061018; }
+  .btn.small { padding: 10px 6px; font-size: 13px; }
+  .btn.danger { border-color: var(--warn); background: rgba(255,77,109,0.12); }
+  .btn.dance { background: linear-gradient(135deg, #ff6ec4, #7873f5); border: none; color: #fff; }
+  .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+    max-width: 220px; margin: 0 auto; }
+  .pad .btn { aspect-ratio: 1; display: flex; align-items: center;
+    justify-content: center; font-size: 22px; }
+  .pad .empty { visibility: hidden; }
+  .status {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    font-size: 14px; margin-bottom: 8px;
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--warn);
+    box-shadow: 0 0 8px var(--warn); }
+  .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .label { font-size: 12px; color: var(--muted); margin-bottom: 8px; text-align: center; }
+  .slider-wrap { display: flex; align-items: center; gap: 10px; }
+  input[type=range] { flex: 1; accent-color: var(--accent); }
+  .speed-val { font-variant-numeric: tabular-nums; min-width: 54px; text-align: right;
+    color: var(--accent); font-weight: 600; }
+  .term {
+    background: #060a14; border-radius: 10px; padding: 10px; height: 120px;
+    overflow-y: auto; font-family: monospace; font-size: 11px; color: #6cff9e;
+    line-height: 1.5;
+  }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 6px; text-align: center; }
+  .section-title { font-size: 13px; color: var(--muted); margin: 0 0 10px 2px; font-weight: 600; }
+</style>
+</head>
+<body>
+
+<h1>🎮 云台<span>遥控</span></h1>
+
+<div class="card">
+  <div class="status">
+    <div class="dot" id="dot"></div>
+    <span id="statusText">未连接</span>
+  </div>
+  <div class="row">
+    <button class="btn primary" id="connectBtn">🔗 连接蓝牙</button>
+    <button class="btn danger" id="disconnectBtn" style="display:none">断开</button>
+  </div>
+  <div class="hint">首次使用需在手机蓝牙配对 JDY-31 (默认名 JDY-31-B 之类)</div>
+</div>
+
+<div class="card">
+  <div class="section-title">方向控制 (活动轴)</div>
+  <div class="pad">
+    <div class="empty"></div>
+    <button class="btn" data-cmd="t r5">↑</button>
+    <div class="empty"></div>
+    <button class="btn" data-cmd="p a">←</button>
+    <button class="btn" data-cmd="s">■</button>
+    <button class="btn" data-cmd="p c">→</button>
+    <div class="empty"></div>
+    <button class="btn" data-cmd="t r-5">↓</button>
+    <div class="empty"></div>
+  </div>
+  <div class="hint">↑↓ 控 Tilt 俯仰 ±5° · ←→ 控 Pan 水平 · ■ 停止</div>
+</div>
+
+<div class="card">
+  <div class="section-title">速度 (步间延时)</div>
+  <div class="slider-wrap">
+    <span>快</span>
+    <input type="range" id="speed" min="900" max="8000" value="2000" step="100">
+    <span class="speed-val" id="speedVal">2000µs</span>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <button class="btn small" data-cmd="p c">▶ 正转</button>
+    <button class="btn small" data-cmd="p a">◀ 反转</button>
+    <button class="btn small" data-cmd="s">⏹ 停</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="section-title">模式 / 轴选择</div>
+  <div class="row">
+    <button class="btn small" data-cmd="p">选水平</button>
+    <button class="btn small" data-cmd="t">选俯仰</button>
+    <button class="btn small" data-cmd="h">半步</button>
+    <button class="btn small" data-cmd="f">全步</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button class="btn small" data-cmd="p w90">扫描±90</button>
+    <button class="btn small" data-cmd="r90">转90°</button>
+    <button class="btn small" data-cmd="?">查询</button>
+  </div>
+  <button class="btn dance" id="danceBtn" style="width:100%;margin-top:10px">💃 跳 舞！</button>
+</div>
+
+<div class="card">
+  <div class="section-title">串口回显</div>
+  <div class="term" id="term"></div>
+  <div class="row" style="margin-top:8px">
+    <button class="btn small" id="clearBtn">清空</button>
+  </div>
+</div>
+
+<script>
+const SERVICE_UUID  = '0000ffe0-0000-1000-8000-00805f9b34fb';
+const CHAR_UUID     = '0000ffe1-0000-1000-8000-00805f9b34fb';
+
+let device = null, server = null, service = null, charac = null;
+let enc = new TextEncoder();
+
+const dot = document.getElementById('dot');
+const statusText = document.getElementById('statusText');
+const connectBtn = document.getElementById('connectBtn');
+const disconnectBtn = document.getElementById('disconnectBtn');
+const term = document.getElementById('term');
+
+function log(msg, cls) {
+  const line = document.createElement('div');
+  line.textContent = msg;
+  if (cls) line.style.color = cls;
+  term.appendChild(line);
+  term.scrollTop = term.scrollHeight;
+}
+
+function setConnected(on) {
+  dot.classList.toggle('on', on);
+  statusText.textContent = on ? '已连接: ' + (device.name || 'JDY-31') : '未连接';
+  connectBtn.style.display = on ? 'none' : 'block';
+  disconnectBtn.style.display = on ? 'block' : 'none';
+}
+
+async function connect() {
+  try {
+    log('扫描蓝牙设备...');
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }],
+      optionalServices: [SERVICE_UUID]
+    });
+    log('已选设备: ' + (device.name || '未知'));
+    server = await device.gatt.connect();
+    service = await server.getPrimaryService(SERVICE_UUID);
+    charac = await service.getCharacteristic(CHAR_UUID);
+    await charac.startNotifications();
+    charac.addEventListener('characteristicvaluechanged', onData);
+    device.addEventListener('gattserverdisconnected', () => { setConnected(false); log('断开连接', '#ff4d6d'); });
+    setConnected(true);
+    log('连接成功 ✓', '#00ff88');
+  } catch (e) {
+    log('连接失败: ' + e.message, '#ff4d6d');
+  }
+}
+
+function onData(event) {
+  const val = event.target.value;
+  const str = new TextDecoder().decode(val);
+  str.split('\n').forEach(l => { if (l.trim()) log(l); });
+}
+
+function send(cmd) {
+  if (!charac) { log('未连接，无法发送', '#ff4d6d'); return; }
+  const data = enc.encode(cmd + '\n');
+  charac.writeValue(data).then(() => log('» ' + cmd, '#00e5ff'))
+    .catch(e => log('发送失败: ' + e.message, '#ff4d6d'));
+}
+
+connectBtn.onclick = connect;
+disconnectBtn.onclick = () => { if (device && device.gatt.connected) device.gatt.disconnect(); };
+
+document.querySelectorAll('[data-cmd]').forEach(b => {
+  b.onclick = () => send(b.dataset.cmd);
+});
+
+document.getElementById('danceBtn').onclick = () => send('d');
+document.getElementById('clearBtn').onclick = () => term.innerHTML = '';
+
+const speed = document.getElementById('speed');
+const speedVal = document.getElementById('speedVal');
+speed.oninput = () => {
+  speedVal.textContent = speed.value + 'µs';
+};
+speed.onchange = () => {
+  // 用当前选中轴的步进延时设置速度
+  send('v' + speed.value);
+};
+
+if (!navigator.bluetooth) {
+  log('⚠️ 当前浏览器不支持 Web Bluetooth', '#ff4d6d');
+  log('请用 Chrome / Edge 安卓版打开', '#ff4d6d');
+}
+</script>
+</body>
+</html>
