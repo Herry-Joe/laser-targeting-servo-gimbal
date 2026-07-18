@@ -91,9 +91,15 @@ static uint32_t g_dance_dir_toggle  = 0;   /* 甩头方向切换计时 */
 
 /* ========================== 串口接收缓冲 (ISR → Main loop) ========================== */
 #define SERIAL_BUF_SIZE  32
+/* USART1 (CH340/调试口) 命令缓冲 */
 static char            s_serial_buf[SERIAL_BUF_SIZE];
 static volatile uint8_t s_serial_len  = 0;
 static volatile uint8_t s_cmd_ready   = 0;
+
+/* USART2 (蓝牙) 独立缓冲 — 防止两个接口的字节交叉污染同一缓冲区 */
+static char            s_bt_buf[SERIAL_BUF_SIZE];
+static volatile uint8_t s_bt_len      = 0;
+static volatile uint8_t s_bt_cmd_ready = 0;
 
 /* ========================== 命令反馈 (LED 视觉反馈) ========================== */
 static uint32_t g_feedback_until = 0;   /* LED 保持亮到此时间戳 */
@@ -2038,6 +2044,18 @@ int main(void)
             s_serial_len = 0;
         }
 
+        /* 蓝牙命令处理 (独立缓冲, 不与 USART1 交叉) */
+        if (s_bt_cmd_ready) {
+            s_bt_cmd_ready = 0;
+            /* 拷贝蓝牙命令到主缓冲并执行 */
+            memcpy(s_serial_buf, s_bt_buf, s_bt_len);
+            s_serial_len = s_bt_len;
+            /* 直接调用 Serial_Execute 处理蓝牙命令 */
+            Serial_Execute();
+            s_serial_len = 0;
+            s_bt_len = 0;
+        }
+
         /* 按键扫描 */
         Gimbal_KeyScan();
 
@@ -2197,14 +2215,14 @@ void USART2_IRQHandler(void)
         g_bt_connected = 1;
         g_bt_last_rx_tick = HAL_GetTick();
 
-        /* 缓冲接收数据 (与 USART1 共用缓冲区) */
-        if (s_serial_len < SERIAL_BUF_SIZE - 1) {
-            s_serial_buf[s_serial_len++] = (char)byte;
+        /* 缓冲接收数据 (使用独立 bt 缓冲, 不与 USART1 交叉) */
+        if (s_bt_len < SERIAL_BUF_SIZE - 1) {
+            s_bt_buf[s_bt_len++] = (char)byte;
         }
         if (byte == '\n' || byte == '\r') {
-            s_cmd_ready = 1;
-        } else if (s_serial_len >= SERIAL_BUF_SIZE - 1) {
-            s_cmd_ready = 1;
+            s_bt_cmd_ready = 1;
+        } else if (s_bt_len >= SERIAL_BUF_SIZE - 1) {
+            s_bt_cmd_ready = 1;
         }
     }
 

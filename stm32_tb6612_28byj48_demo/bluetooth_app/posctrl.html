@@ -1,252 +1,377 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>28BYJ-48 位置闭环调试台</title>
-  <style>
-    :root { --bg:#f7f8fa; --card:#fff; --text:#1f2937; --muted:#6b7280; --border:#e5e7eb; --blue:#2563eb; --red:#dc2626; --green:#16a34a; --amber:#f59e0b; }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
-    header { padding: 16px 24px; background: var(--card); border-bottom: 1px solid var(--border); }
-    h1 { margin:0; font-size: 18px; }
-    .wrap { padding: 20px 24px; max-width: 1200px; margin: 0 auto; display: grid; gap: 18px; }
-    .card { background: var(--card); border-radius: 10px; border: 1px solid var(--border); padding: 18px; }
-    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
-    .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
-    label { font-size: 13px; color: var(--muted); min-width: 60px; }
-    input[type="text"], input[type="number"], select { padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; }
-    button { padding: 8px 14px; border: none; border-radius: 6px; background: var(--blue); color: #fff; font-size: 14px; cursor: pointer; }
-    button:hover { opacity: .9; }
-    button:disabled { background: #9ca3af; cursor: not-allowed; }
-    button.ghost { background: var(--card); color: var(--text); border: 1px solid var(--border); }
-    .tune { display: grid; gap: 10px; }
-    .tune-row { display: flex; align-items: center; gap: 10px; }
-    .tune-row .lab { width: 60px; font-size: 13px; color: var(--muted); }
-    .tune-row input[type=range] { flex: 1; }
-    .tune-row .val { width: 70px; text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; }
-    .valbox { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
-    .valbox div { background: #f9fafb; border: 1px solid var(--border); border-radius: 6px; padding: 8px; text-align: center; }
-    .valbox .v { font-size: 18px; font-weight: 600; }
-    .valbox .k { font-size: 11px; color: var(--muted); margin-top: 4px; }
-    canvas { width: 100%; height: 220px; background: #f9fafb; border: 1px solid var(--border); border-radius: 6px; }
-    #term { width: 100%; height: 180px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: #111827; color: #e5e7eb; border-radius: 6px; padding: 10px; overflow: auto; white-space: pre-wrap; }
-    .send-row { display: flex; gap: 8px; margin-top: 10px; }
-    .send-row input { flex: 1; }
-    .status { font-size: 12px; color: var(--muted); }
-    .status span { color: var(--green); font-weight: 600; }
-    .status span.off { color: var(--red); }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>28BYJ-48 云台调试台 · 菜单版</title>
+<style>
+:root{--bg:#f0f2f5;--card:#fff;--text:#1f2937;--muted:#6b7280;--border:#d1d5db;--primary:#2563eb;--primary-hover:#1d4ed8;--red:#dc2626;--green:#16a34a;--amber:#f59e0b;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+header{padding:12px 20px;background:var(--card);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+header h1{font-size:16px;font-weight:600;white-space:nowrap}
+header .status{font-size:12px;color:var(--muted);margin-left:auto}
+header .status span{font-weight:600}
+.status-on{color:var(--green)}.status-off{color:var(--red)}
+.menu{display:flex;gap:2px;background:var(--card);padding:0 20px;border-bottom:1px solid var(--border)}
+.menu button{padding:10px 18px;border:none;background:transparent;color:var(--muted);font-size:14px;cursor:pointer;border-bottom:3px solid transparent;transition:all .15s}
+.menu button:hover{color:var(--text);background:#f3f4f6}
+.menu button.active{color:var(--primary);border-bottom-color:var(--primary);font-weight:600}
+.tab{display:none;padding:20px;max-width:1100px;margin:0 auto}
+.tab.active{display:block}
+.card{background:var(--card);border-radius:10px;border:1px solid var(--border);padding:18px;margin-bottom:16px}
+.card h3{font-size:15px;margin-bottom:12px;font-weight:600}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.row label{font-size:13px;color:var(--muted);min-width:60px}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
+button{padding:8px 16px;border:none;border-radius:6px;background:var(--primary);color:#fff;font-size:13px;cursor:pointer;white-space:nowrap}
+button:hover{background:var(--primary-hover)}
+button:disabled{background:#9ca3af;cursor:not-allowed}
+button.ghost{background:var(--card);color:var(--text);border:1px solid var(--border)}
+button.ghost:hover{background:#f3f4f6}
+button.danger{background:var(--red)}
+button.success{background:var(--green)}
+button.amber{background:var(--amber);color:#000}
+input,select{padding:7px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;font-family:inherit}
+input[type=number]{width:90px}
+input[type=range]{flex:1;min-width:80px}
+.slider-row{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.slider-row .lab{width:55px;font-size:12px;color:var(--muted);text-align:right}
+.slider-row .val{width:70px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px}
+.val-row{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px}
+.val-item{background:#f9fafb;border:1px solid var(--border);border-radius:6px;padding:8px;text-align:center}
+.val-item .num{font-size:20px;font-weight:700}
+.val-item .lbl{font-size:11px;color:var(--muted);margin-top:2px}
+canvas{width:100%;height:200px;background:#fafafa;border:1px solid var(--border);border-radius:6px;display:block}
+#term{width:100%;height:200px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;background:#111827;color:#22d3ee;border-radius:6px;padding:10px;overflow:auto;white-space:pre-wrap;line-height:1.5}
+.send-row{display:flex;gap:8px;margin-top:8px}
+.send-row input{flex:1}
+code{background:#f3f4f6;padding:2px 5px;border-radius:4px;font-size:12px}
+.help-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+.help-item{border:1px solid var(--border);border-radius:8px;padding:14px}
+.help-item h4{font-size:13px;margin-bottom:6px}
+.help-item p{font-size:12px;color:var(--muted);line-height:1.6}
+.help-item code{font-size:11px}
+</style>
 </head>
 <body>
-  <header>
-    <h1>28BYJ-48 双轴云台 · 位置闭环调试台</h1>
-  </header>
-  <div class="wrap">
+
+<header>
+  <h1>28BYJ-48 云台 · 菜单版</h1>
+  <button id="btnConnect">🔗 连接</button>
+  <button id="btnDisconnect" class="ghost" disabled>断开</button>
+  <select id="baud"><option value="115200">115200</option><option value="9600">9600</option></select>
+  <span class="status">状态: <span id="connStatus" class="status-off">未连接</span></span>
+</header>
+
+<div class="menu" id="menuBar">
+  <button class="active" data-tab="pos">📍 位置控制</button>
+  <button data-tab="trace">⬜ 循迹测试</button>
+  <button data-tab="pid">🎛️ PID 调参</button>
+  <button data-tab="k230">🎯 K230 追踪</button>
+  <button data-tab="monitor">📟 监视器</button>
+  <button data-tab="help">❓ 帮助</button>
+</div>
+
+<!-- ===================== Tab: 位置控制 ===================== -->
+<div class="tab active" id="tab-pos">
+  <div class="grid2">
     <div class="card">
+      <h3>🎯 目标位置</h3>
+      <div class="row"><label>Pan (°)</label><input id="panTarget" type="number" value="0" step="5" min="-180" max="180"><button onclick="cmd('x'+v('panTarget'))">→ 发送</button></div>
+      <div class="row"><label>Tilt (°)</label><input id="tiltTarget" type="number" value="0" step="5" min="-35" max="35"><button onclick="cmd('y'+v('tiltTarget'))">→ 发送</button></div>
       <div class="row">
-        <button id="btnConnect">连接串口 (CH340)</button>
-        <button id="btnDisconnect" class="ghost" disabled>断开</button>
-        <select id="baud">
-          <option value="115200" selected>115200</option>
-          <option value="9600">9600</option>
-        </select>
-        <span class="status">状态: <span id="connStatus" class="off">未连接</span></span>
+        <button onclick="cmd('z')">🔄 归零</button>
+        <button class="ghost" onclick="cmd('s')">⏹ 停止</button>
+        <button class="ghost" onclick="cmd('m')">📌 位置环</button>
+        <button class="ghost" onclick="cmd('k')">🎯 K230</button>
       </div>
     </div>
-
-    <div class="grid2">
-      <div class="card">
-        <h3>目标位置</h3>
-        <div class="row">
-          <label>Pan(°)</label>
-          <input id="panTarget" type="number" value="0" step="5">
-          <button onclick="send('x' + document.getElementById('panTarget').value)">发送</button>
-        </div>
-        <div class="row" style="margin-top:10px">
-          <label>Tilt(°)</label>
-          <input id="tiltTarget" type="number" value="0" step="5">
-          <button onclick="send('y' + document.getElementById('tiltTarget').value)">发送</button>
-        </div>
-        <div class="row" style="margin-top:12px">
-          <button onclick="send('z')">归零</button>
-          <button onclick="send('s')" class="ghost">停止</button>
-          <button onclick="send('m')" class="ghost">切回位置环</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>Pan PID</h3>
-        <div class="tune">
-          <div class="tune-row"><span class="lab">Kp</span><input type="range" id="pPanKp" min="0.0001" max="0.005" step="0.0001" value="0.0006"><span class="val" id="pPanKpV">0.0006</span></div>
-          <div class="tune-row"><span class="lab">Ki</span><input type="range" id="pPanKi" min="0" max="0.0001" step="0.000005" value="0"><span class="val" id="pPanKiV">0.00000</span></div>
-          <div class="tune-row"><span class="lab">Kd</span><input type="range" id="pPanKd" min="0" max="0.001" step="0.00001" value="0.00005"><span class="val" id="pPanKdV">0.00005</span></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>Tilt PID</h3>
-        <div class="tune">
-          <div class="tune-row"><span class="lab">Kp</span><input type="range" id="pTiltKp" min="0.0001" max="0.005" step="0.0001" value="0.0006"><span class="val" id="pTiltKpV">0.0006</span></div>
-          <div class="tune-row"><span class="lab">Ki</span><input type="range" id="pTiltKi" min="0" max="0.0001" step="0.000005" value="0"><span class="val" id="pTiltKiV">0.00000</span></div>
-          <div class="tune-row"><span class="lab">Kd</span><input type="range" id="pTiltKd" min="0" max="0.001" step="0.00001" value="0.00005"><span class="val" id="pTiltKdV">0.00005</span></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>实时数据</h3>
-        <div class="valbox">
-          <div><div class="v" id="vPanA">0.0</div><div class="k">Pan 角度°</div></div>
-          <div><div class="v" id="vPanE">0</div><div class="k">Pan 误差步</div></div>
-          <div><div class="v" id="vTiltA">0.0</div><div class="k">Tilt 角度°</div></div>
-          <div><div class="v" id="vTiltE">0</div><div class="k">Tilt 误差步</div></div>
-        </div>
-      </div>
-    </div>
-
     <div class="card">
-      <h3>曲线</h3>
-      <canvas id="chart"></canvas>
-    </div>
-
-    <div class="card">
-      <h3>串口监视</h3>
-      <div id="term"></div>
-      <div class="send-row">
-        <input id="cmdLine" type="text" placeholder="输入命令, 回车发送" onkeydown="if(event.key==='Enter')sendLine()">
-        <button onclick="sendLine()">发送</button>
+      <h3>📊 实时数据</h3>
+      <div class="val-row" id="liveValues">
+        <div class="val-item"><div class="num" id="lvPan">0.0</div><div class="lbl">Pan(°)</div></div>
+        <div class="val-item"><div class="num" id="lvTilt">0.0</div><div class="lbl">Tilt(°)</div></div>
+        <div class="val-item"><div class="num" id="lvPerr">0</div><div class="lbl">Pan 误差</div></div>
+        <div class="val-item"><div class="num" id="lvTerr">0</div><div class="lbl">Tilt 误差</div></div>
       </div>
     </div>
   </div>
+  <div class="card"><h3>位置轨迹</h3><canvas id="posChart"></canvas></div>
+</div>
 
-  <script>
-    let port=null, reader=null, writer=null, keepReading=false;
-    const term=document.getElementById('term');
-    const chart=document.getElementById('chart');
-    const ctx=chart.getContext('2d');
-    const MAX=200;
-    const data={panA:[],panT:[],panE:[],tiltA:[],tiltT:[],tiltE:[]};
+<!-- ===================== Tab: 循迹测试 ===================== -->
+<div class="tab" id="tab-trace">
+  <div class="grid2">
+    <div class="card">
+      <h3>⬜ 矩形循迹</h3>
+      <div class="row"><label>大小(步)</label><input id="traceSize" type="number" value="300" min="50" max="2000"><span style="font-size:12px;color:var(--muted)">(300≈±26°)</span></div>
+      <div class="row">
+        <button class="success" onclick="cmd('trace '+v('traceSize'))">▶ 启动循迹</button>
+        <button class="danger" onclick="cmd('stop')">⏹ 停止</button>
+      </div>
+      <div style="font-size:13px;color:var(--muted);margin-top:8px">云台以当前位置为中心画矩形，4 角自动切换，<code>stop</code> 停止。</div>
+    </div>
+    <div class="card">
+      <h3>🔄 回程差测试</h3>
+      <div class="row"><label>Pan 回程</label><input id="blPan" type="number" value="50" min="0" max="200"><button onclick="cmd('backlash p '+v('blPan'))">设置</button></div>
+      <div class="row"><label>Tilt 回程</label><input id="blTilt" type="number" value="50" min="0" max="200"><button onclick="cmd('backlash t '+v('blTilt'))">设置</button></div>
+      <div class="row"><button class="ghost" onclick="cmd('backlash')">📖 当前值</button></div>
+      <div style="font-size:13px;color:var(--muted);margin-top:8px">28BYJ-48 回程差典型 30~80 步。换向抖动就加大，转向迟钝就减小。</div>
+    </div>
+  </div>
+</div>
 
-    function push(arr,v){ arr.push(v); if(arr.length>MAX) arr.shift(); }
-    function log(s){ term.textContent+=s+'\n'; term.scrollTop=term.scrollHeight; }
+<!-- ===================== Tab: PID 调参 ===================== -->
+<div class="tab" id="tab-pid">
+  <div class="grid2">
+    <div class="card">
+      <h3>Pan 位置 PID</h3>
+      <div class="slider-row"><span class="lab">Kp</span><input type="range" min="0.00005" max="0.005" step="0.00005" value="0.0006" id="pkp"><span class="val" id="pkpV">0.0006</span><button onclick="cmd('pid p kp '+v('pkp'))" style="font-size:11px;padding:4px 8px">↩</button></div>
+      <div class="slider-row"><span class="lab">Ki</span><input type="range" min="0" max="0.001" step="0.00001" value="0" id="pki"><span class="val" id="pkiV">0.00000</span><button onclick="cmd('pid p ki '+v('pki'))" style="font-size:11px;padding:4px 8px">↩</button></div>
+      <div class="slider-row"><span class="lab">Kd</span><input type="range" min="0" max="0.0005" step="0.00001" value="0.00005" id="pkd"><span class="val" id="pkdV">0.00005</span><button onclick="cmd('pid p kd '+v('pkd'))" style="font-size:11px;padding:4px 8px">↩</button></div>
+    </div>
+    <div class="card">
+      <h3>Tilt 位置 PID</h3>
+      <div class="slider-row"><span class="lab">Kp</span><input type="range" min="0.00005" max="0.005" step="0.00005" value="0.0006" id="tkp"><span class="val" id="tkpV">0.0006</span><button onclick="cmd('pid t kp '+v('tkp'))" style="font-size:11px;padding:4px 8px">↩</button></div>
+      <div class="slider-row"><span class="lab">Ki</span><input type="range" min="0" max="0.001" step="0.00001" value="0" id="tki"><span class="val" id="tkiV">0.00000</span><button onclick="cmd('pid t ki '+v('tki'))" style="font-size:11px;padding:4px 8px">↩</button></div>
+      <div class="slider-row"><span class="lab">Kd</span><input type="range" min="0" max="0.0005" step="0.00001" value="0.00005" id="tkd"><span class="val" id="tkdV">0.00005</span><button onclick="cmd('pid t kd '+v('tkd'))" style="font-size:11px;padding:4px 8px">↩</button></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>💡 调参口诀</h3>
+    <div style="font-size:13px;color:var(--muted);line-height:1.8">
+      <code>Kp</code> 太小 → 追得慢 &nbsp;|&nbsp; <code>Kp</code> 太大 → 抖动过冲<br>
+      <code>Ki</code> 消除静差（一般 0） &nbsp;|&nbsp; <code>Kd</code> 抑制过冲（微调）<br>
+      先调 <code>Kp</code> 到接近目标不抖，再加 <code>Kd</code> 消过冲。
+    </div>
+  </div>
+</div>
 
-    function fmt6(v){ return Number(v).toFixed(6); }
-    function fmt1(v){ return Number(v).toFixed(1); }
-    function fmt0(v){ return Math.round(v); }
+<!-- ===================== Tab: K230 ===================== -->
+<div class="tab" id="tab-k230">
+  <div class="grid2">
+    <div class="card">
+      <h3>🎯 K230 自动打靶</h3>
+      <div class="row"><button class="success" onclick="cmd('k')">▶ 切到自动追踪</button><button class="ghost" onclick="cmd('m')">⏹ 切回位置环</button></div>
+      <div style="font-size:13px;color:var(--muted);margin-top:8px">发 <code>k</code> 切换 AUTO 模式，K230 视觉发误差驱动云台。监视器查看 <code>KF/err</code> 值。</div>
+    </div>
+    <div class="card">
+      <h3>🔧 K230 PID (速度环)</h3>
+      <div class="slider-row"><span class="lab">Kp</span><input type="range" min="0.1" max="3" step="0.1" value="1" id="kp230"><span class="val" id="kp230V">1.0</span><button onclick="cmd('g p kp '+v('kp230'))" style="font-size:11px;padding:4px 8px">↩</button></div>
+      <div class="slider-row"><span class="lab">减速区</span><input type="range" min="10" max="120" step="5" value="35" id="dz230"><span class="val" id="dz230V">35</span><button onclick="cmd('g p ki '+v('dz230'))" style="font-size:11px;padding:4px 8px">↩</button></div>
+    </div>
+  </div>
+</div>
 
-    async function connect(){
-      if(!navigator.serial){ log('当前浏览器不支持 Web Serial, 请用 Chrome/Edge'); return; }
-      try{
-        port=await navigator.serial.requestPort({filters:[]});
-        await port.open({baudRate:parseInt(document.getElementById('baud').value)});
-        writer=await port.writable.getWriter();
-        log('串口已连接');
-        document.getElementById('connStatus').textContent='已连接'; document.getElementById('connStatus').className='';
-        document.getElementById('btnConnect').disabled=true; document.getElementById('btnDisconnect').disabled=false;
-        keepReading=true; readLoop();
-        port.addEventListener('disconnect', onDisconnect);
-      }catch(e){ log('连接失败: '+e.message); }
+<!-- ===================== Tab: 监视器 ===================== -->
+<div class="tab" id="tab-monitor">
+  <div class="card">
+    <div class="row">
+      <button class="ghost" id="btnClearTerm">🧹 清屏</button>
+      <span style="font-size:12px;color:var(--muted)">显示串口收到的所有数据</span>
+    </div>
+    <div id="term">等待串口连接...</div>
+    <div class="send-row">
+      <input id="cmdInput" placeholder="输入命令，回车发送">
+      <button onclick="sendCmd()">发送</button>
+      <select id="cmdPreset" onchange="if(this.value){document.getElementById('cmdInput').value=this.value}">
+        <option value="">📋 常用命令</option>
+        <option value="?">? 状态</option>
+        <option value="z">z 归零</option>
+        <option value="s">s 停止</option>
+        <option value="k">k 切 K230</option>
+        <option value="m">m 切位置环</option>
+        <option value="trace 300">trace 300 循迹</option>
+        <option value="backlash">backlash 查回程</option>
+      </select>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== Tab: 帮助 ===================== -->
+<div class="tab" id="tab-help">
+  <h3 style="margin-bottom:12px">📖 命令手册</h3>
+  <div class="help-grid">
+    <div class="help-item"><h4>📍 位置控制</h4><p><code>x90</code> Pan 到 90°<br><code>y30</code> Tilt 到 30°<br><code>z</code> 归零<br><code>s</code> 停止</p></div>
+    <div class="help-item"><h4>🎛️ PID 调参</h4><p><code>pid p kp 0.001</code><br><code>pid t ki 0.00001</code><br><code>pid p kd 0.00005</code></p></div>
+    <div class="help-item"><h4>⬜ 循迹测试</h4><p><code>trace 300</code> 启动<br><code>stop</code> 停止<br>云台画矩形测试流畅度</p></div>
+    <div class="help-item"><h4>🔄 回程差</h4><p><code>backlash p 50</code><br><code>backlash t 30</code><br><code>backlash</code> 查当前值</p></div>
+    <div class="help-item"><h4>🎯 K230</h4><p><code>k</code> 切换自动打靶<br><code>m</code> 切回位置环<br><code>g p kp 1.0</code> 调速度环</p></div>
+  </div>
+</div>
+
+<script>
+// ==== UI helpers ====
+const $=id=>document.getElementById(id);
+const v=id=>$('id')?$('id').value:0;
+
+// Tab switching
+document.querySelectorAll('.menu button').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.menu button').forEach(b=>b.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+    btn.classList.add('active');
+    $(`tab-${btn.dataset.tab}`).classList.add('active');
+  });
+});
+
+// Slider display
+document.querySelectorAll('input[type=range]').forEach(sl=>{
+  const dv=document.getElementById(sl.id+'V');
+  if(dv){sl.addEventListener('input',()=>{dv.textContent=parseFloat(sl.value).toFixed(sl.step.indexOf('.')>=0?sl.value.split('.')[1]?.length||5:0);});}
+});
+
+// Preset command
+document.getElementById('cmdPreset').addEventListener('change',function(){
+  if(this.value) sendCmdText(this.value);
+  this.value='';
+});
+
+// ==== Serial ====
+let port,reader;
+const term=$('term');
+
+function log(msg){term.textContent+=msg+'\n';term.scrollTop=term.scrollHeight;}
+
+async function connect(){
+  try{
+    port=await navigator.serial.requestPort();
+    const baud=parseInt($('baud').value);
+    await port.open({baudRate:baud});
+    $('btnConnect').disabled=true;
+    $('btnDisconnect').disabled=false;
+    $('connStatus').textContent='已连接';
+    $('connStatus').className='status-on';
+    log(`✅ 已连接 ${baud} baud`);
+
+    reader=port.readable.getReader();
+    readLoop();
+  }catch(e){log(`❌ 连接失败: ${e.message}`);}
+}
+
+async function readLoop(){
+  if(!port||!port.readable)return;
+  try{
+    while(true){
+      const {value,done}=await reader.read();
+      if(done)break;
+      const s=new TextDecoder().decode(value);
+      term.textContent+=s;
+      term.scrollTop=term.scrollHeight;
+      parseTelemetry(s);
+      // keep last 5000 chars
+      if(term.textContent.length>5000) term.textContent=term.textContent.slice(-3000);
     }
+  }catch(e){
+    if(e.message!='The reader was cancelled.') log(`⚠️ 读取错误: ${e.message}`);
+  }finally{
+    reader.releaseLock();
+    if(port&&port.readable) reader=port.readable.getReader();
+  }
+}
 
-    async function readLoop(){
-      const textDecoder=new TextDecoder();
-      reader=port.readable.getReader();
-      while(keepReading && reader){
-        try{
-          const {value,done}=await reader.read();
-          if(done || !keepReading) break;
-          if(value) parseChunk(textDecoder.decode(value,{stream:true}));
-        }catch(e){ if(e.name!=='AbortError') log('读错误: '+e.message); break; }
-      }
-      if(reader){ try{await reader.releaseLock();}catch{} reader=null; }
-    }
+function parseTelemetry(s){
+  // POS,panA,panTarget,panErr,panOut,tiltA,tiltTarget,tiltErr,tiltOut
+  const m=s.match(/POS,([\d.-]+),([\d.-]+),([\d.-]+),([\d.-]+),([\d.-]+),([\d.-]+),([\d.-]+),([\d.-]+)/);
+  if(m){
+    $('lvPan').textContent=parseFloat(m[1]).toFixed(1);
+    $('lvTilt').textContent=parseFloat(m[5]).toFixed(1);
+    $('lvPerr').textContent=parseFloat(m[3]).toFixed(0);
+    $('lvTerr').textContent=parseFloat(m[7]).toFixed(0);
+    updatePosChart(m);
+  }
+}
 
-    let rxBuf='';
-    function parseChunk(chunk){
-      rxBuf+=chunk;
-      let i;
-      while((i=rxBuf.indexOf('\n'))!==-1){
-        const line=rxBuf.slice(0,i).replace(/\r/g,''); rxBuf=rxBuf.slice(i+1);
-        if(line.startsWith('POS,')) parseTelemetry(line);
-        else log(line);
-      }
-    }
+async function disconnect(){
+  try{
+    if(reader) await reader.cancel();
+  }catch(e){}
+  try{
+    if(port){await port.close();port=null;}
+  }catch(e){}
+  $('btnConnect').disabled=false;
+  $('btnDisconnect').disabled=true;
+  $('connStatus').textContent='未连接';
+  $('connStatus').className='status-off';
+  log('⏹ 已断开');
+}
 
-    function parseTelemetry(line){
-      const p=line.split(','); if(p.length<9) return;
-      const panA=parseFloat(p[1]), panT=parseFloat(p[2]), panE=parseFloat(p[3]);
-      const tiltA=parseFloat(p[5]), tiltT=parseFloat(p[6]), tiltE=parseFloat(p[7]);
-      push(data.panA, panA); push(data.panT, panT); push(data.panE, panE);
-      push(data.tiltA, tiltA); push(data.tiltT, tiltT); push(data.tiltE, tiltE);
-      document.getElementById('vPanA').textContent=fmt1(panA);
-      document.getElementById('vPanE').textContent=fmt0(panE);
-      document.getElementById('vTiltA').textContent=fmt1(tiltA);
-      document.getElementById('vTiltE').textContent=fmt0(tiltE);
-      drawChart();
-    }
+function cmd(text){
+  sendCmdText(text);
+}
 
-    function drawChart(){
-      const w=chart.width=chart.clientWidth, h=chart.height=chart.clientHeight;
-      ctx.clearRect(0,0,w,h);
-      ctx.strokeStyle='#e5e7eb'; ctx.beginPath(); ctx.moveTo(0,h/2); ctx.lineTo(w,h/2); ctx.stroke();
-      const all=[...data.panE,...data.tiltE]; let max=0; all.forEach(v=>{ const a=Math.abs(v); if(a>max) max=a; });
-      if(max<10) max=10; const scaleY=(h/2-10)/max;
-      function draw(arr, color, dashed){
-        if(arr.length<2) return;
-        ctx.strokeStyle=color; ctx.setLineDash(dashed?[4,4]:[]); ctx.lineWidth=2; ctx.beginPath();
-        for(let i=0;i<arr.length;i++){
-          const x=i/(MAX-1)*w; const y=h/2 - arr[i]*scaleY; if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
-        }
-        ctx.stroke(); ctx.setLineDash([]);
-      }
-      draw(data.panE, '#2563eb', false);
-      draw(data.tiltE, '#dc2626', false);
-      draw(data.panT, '#10b981', true);   /* 目标位置(角度) */
-      draw(data.tiltT, '#f59e0b', true);
-      ctx.fillStyle='#6b7280'; ctx.font='12px sans-serif'; ctx.fillText('误差±0', 6, h/2+14);
-      ctx.fillStyle='#2563eb'; ctx.fillText('Pan误差', 6, 14);
-      ctx.fillStyle='#dc2626'; ctx.fillText('Tilt误差', 56, 14);
-      ctx.fillStyle='#10b981'; ctx.fillText('Pan目标(虚)', 116, 14);
-      ctx.fillStyle='#f59e0b'; ctx.fillText('Tilt目标(虚)', 196, 14);
-    }
+function sendCmdText(text){
+  if(!port){log('❌ 请先连接串口');return;}
+  const writer=port.writable.getWriter();
+  writer.write(new TextEncoder().encode(text+'\n'));
+  writer.releaseLock();
+  log(`> ${text}`);
+}
 
-    async function send(s){
-      if(!writer){ log('请先连接串口'); return; }
-      const data=(s+'\r\n'); const enc=new TextEncoder().encode(data);
-      await writer.write(enc);
-    }
+function sendCmd(){
+  const inp=$('cmdInput');
+  if(inp.value.trim()) sendCmdText(inp.value.trim());
+  inp.value='';
+}
 
-    function sendLine(){ const el=document.getElementById('cmdLine'); send(el.value); el.value=''; }
+$('btnConnect').addEventListener('click',connect);
+$('btnDisconnect').addEventListener('click',disconnect);
+$('btnClearTerm').addEventListener('click',()=>{$('term').textContent='串口已清屏\n'});
+$('cmdInput').addEventListener('keydown',e=>{if(e.key==='Enter')sendCmd();});
 
-    async function onDisconnect(){
-      keepReading=false; if(reader) await reader.cancel().catch(()=>{});
-      if(writer){ writer.releaseLock(); writer=null; }
-      try{ await port.close(); }catch{} port=null; reader=null;
-      document.getElementById('connStatus').textContent='未连接'; document.getElementById('connStatus').className='off';
-      document.getElementById('btnConnect').disabled=false; document.getElementById('btnDisconnect').disabled=true;
-      log('串口已断开');
-    }
+// ==== Pos Chart ====
+const canvas=$('posChart');
+const ctx=canvas.getContext('2d');
+const chartData={pan:[],tilt:[],maxPoints:60};
+function resizeCanvas(){const r=canvas.parentElement.getBoundingClientRect();canvas.width=canvas.clientWidth;canvas.height=canvas.clientHeight;}
+window.addEventListener('resize',resizeCanvas);
+resizeCanvas();
 
-    async function disconnect(){
-      keepReading=false; if(reader) await reader.cancel().catch(()=>{});
-      if(writer){ writer.releaseLock(); writer=null; }
-      if(port){ try{await port.close();}catch{} port=null; }
-      document.getElementById('connStatus').textContent='未连接'; document.getElementById('connStatus').className='off';
-      document.getElementById('btnConnect').disabled=false; document.getElementById('btnDisconnect').disabled=true;
-      log('串口已断开');
-    }
+function updatePosChart(m){
+  const pa=parseFloat(m[1]);  // pan actual
+  const ta=parseFloat(m[5]);  // tilt actual
+  chartData.pan.push(pa);
+  chartData.tilt.push(ta);
+  if(chartData.pan.length>chartData.maxPoints){chartData.pan.shift();chartData.tilt.shift();}
+  drawPosChart();
+}
 
-    document.getElementById('btnConnect').onclick=connect;
-    document.getElementById('btnDisconnect').onclick=disconnect;
+function drawPosChart(){
+  const w=canvas.width,h=canvas.height;
+  ctx.clearRect(0,0,w,h);
+  if(chartData.pan.length<2) return;
 
-    /* PID 滑块 */
-    function bindSlider(id, axis, param, fmt){
-      const el=document.getElementById(id), disp=document.getElementById(id+'V');
-      el.oninput=()=>{ disp.textContent=fmt(el.value); };
-      el.onchange=()=>{ send('pid '+axis+' '+param+' '+el.value); };
-    }
-    bindSlider('pPanKp','p','kp',fmt6); bindSlider('pPanKi','p','ki',fmt6); bindSlider('pPanKd','p','kd',fmt6);
-    bindSlider('pTiltKp','t','kp',fmt6); bindSlider('pTiltKi','t','ki',fmt6); bindSlider('pTiltKd','t','kd',fmt6);
-  </script>
+  // Grid
+  ctx.strokeStyle='#e5e7eb';ctx.lineWidth=1;
+  for(let i=0;i<5;i++){ctx.beginPath();ctx.moveTo(0,h*i/4);ctx.lineTo(w,h*i/4);ctx.stroke();}
+
+  const len=chartData.pan.length;
+  const maxVal=Math.max(...chartData.pan.map(Math.abs),...chartData.tilt.map(Math.abs),10);
+
+  // Tilt trace (blue)
+  ctx.strokeStyle='#3b82f6';ctx.lineWidth=2;
+  ctx.beginPath();
+  chartData.tilt.forEach((v,i)=>{const x=(i/(len-1))*w;const y=h/2-(v/maxVal)*h*0.4;i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
+  ctx.stroke();
+
+  // Pan trace (red)
+  ctx.strokeStyle='#ef4444';ctx.lineWidth=2;
+  ctx.beginPath();
+  chartData.pan.forEach((v,i)=>{const x=(i/(len-1))*w;const y=h/2-(v/maxVal)*h*0.4;i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
+  ctx.stroke();
+
+  // Legends
+  ctx.fillStyle='#6b7280';ctx.font='11px sans-serif';
+  ctx.fillText('🔴 Pan',8,14);
+  ctx.fillStyle='#3b82f6';
+  ctx.fillText('🔵 Tilt',70,14);
+}
+
+// Init
+log('🔌 点击「连接」选择 CH340 串口 (115200)');
+log('📋 菜单栏切换功能页面');
+log('💡 如需帮助请切到「帮助」标签');
+</script>
 </body>
 </html>
