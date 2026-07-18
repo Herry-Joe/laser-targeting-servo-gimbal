@@ -396,12 +396,25 @@ static float PosPID_Update(PosPID *pid, float err)
 #define POS_LIMIT_TILT_MIN  -400    /* Tilt ±35° */
 #define POS_LIMIT_TILT_MAX  400
 
+/* ---- 回程差补偿 (28BYJ-48 减速齿轮间隙) ----
+ * 标准 28BYJ-48 64:1 减速箱回程差约 30~80 个半步步距.
+ * 通过 serial 命令 'backlash <轴> <步数>' 可运行时调整并保存到 EEPROM.
+ * 默认 50 步，对应约 4.4° 机械回程差。 */
+#define BACKLASH_STEPS_DEFAULT  50
+static int32_t g_backlash_pan  = BACKLASH_STEPS_DEFAULT;
+static int32_t g_backlash_tilt = BACKLASH_STEPS_DEFAULT;
+/* 上次运动方向 (用于检测换向) */
+static Direction g_last_dir_pan  = DIR_CW;
+static Direction g_last_dir_tilt = DIR_CW;
+
 static PosPID g_pos_pid_pan;
 static PosPID g_pos_pid_tilt;
 
 /* 前向声明: 位置环辅助函数 */
 static int32_t PosCtrl_AngleToSteps(float angle);
 static float   PosCtrl_StepsToAngle(int32_t steps);
+static void PosCtrl_BacklashComp(StepperMotor *motor, int32_t *target,
+                                  Direction *last_dir, int32_t backlash_steps);
 
 /* 目标位置 (步), 可串口/上位机设置 */
 static int32_t g_pos_target_pan  = 0;
@@ -900,6 +913,20 @@ static void Serial_Execute(void)
         CmdReply("# OK 切换回位置闭环模式\r\n");
         return;
     }
+    if (strncmp(p, "backlash", 8) == 0 || strncmp(p, "BACKLASH", 8) == 0) {
+        char axis = 0;
+        int steps = 0;
+        if (sscanf(p + 8, " %c %d", &axis, &steps) == 2) {
+            if ((axis | 0x20) == 'p') { g_backlash_pan = steps; }
+            else if ((axis | 0x20) == 't') { g_backlash_tilt = steps; }
+            else { CmdReply("# ERR 轴: p=Pan, t=Tilt\r\n"); return; }
+            g_feedback_until = HAL_GetTick() + 150;
+            CmdReply("# OK %s 回程差 = %d 步\r\n", ((axis|0x20)=='p')?"Pan":"Tilt", steps);
+        } else {
+            CmdReply("# OK Pan=%ld步 Tilt=%ld步\r\n", (long)g_backlash_pan, (long)g_backlash_tilt);
+        }
+        return;
+    }
 
     /* ---- 串口接管 + 视觉反馈 ----
      * 其他串口命令先把云台切到 SERIAL 模式, 避免被 Pan/Sweep/Dance 的主循环逻辑覆盖；
@@ -1113,12 +1140,18 @@ static float PosCtrl_RunAxis(StepperMotor *motor, PosPID *pid,
 
 static void PosCtrl_Update(void)
 {
-    /* 同步目标位置到电机结构体 */
-    g_motor_pan.target_pos  = g_pos_target_pan;
-    g_motor_tilt.target_pos = g_pos_target_tilt;
+    /* 回程差补偿 */
+    int32_t pan_target  = g_pos_target_pan;
+    int32_t tilt_target = g_pos_target_tilt;
+    PosCtrl_BacklashComp(&g_motor_pan,  &pan_target,  &g_last_dir_pan,  g_backlash_pan);
+    PosCtrl_BacklashComp(&g_motor_tilt, &tilt_target, &g_last_dir_tilt, g_backlash_tilt);
 
-    PosCtrl_RunAxis(&g_motor_pan,  &g_pos_pid_pan,  g_pos_target_pan,  &g_pos_out_filt_pan,  1.0f, "Pan");
-    PosCtrl_RunAxis(&g_motor_tilt, &g_pos_pid_tilt, g_pos_target_tilt, &g_pos_out_filt_tilt, 0.7f, "Tilt");
+    /* 同步目标位置到电机结构体 */
+    g_motor_pan.target_pos  = pan_target;
+    g_motor_tilt.target_pos = tilt_target;
+
+    PosCtrl_RunAxis(&g_motor_pan,  &g_pos_pid_pan,  pan_target,  &g_pos_out_filt_pan,  1.0f, "Pan");
+    PosCtrl_RunAxis(&g_motor_tilt, &g_pos_pid_tilt, tilt_target, &g_pos_out_filt_tilt, 0.7f, "Tilt");
 }
 
 /* 角度 → 步数: 1步≈0.08789°, 4096步/圈 */
@@ -1134,6 +1167,37 @@ static float PosCtrl_StepsToAngle(int32_t steps)
 
 /* 位置闭环遥测: 100ms 发送一次 CSV 到 USART1 (CH340 调试口) */
 static uint32_t pos_telemetry_tick = 0;
+
+/**
+ * @brief 回程差补偿: 检测到电机换向时, 在目标位置基础上多走 backlash 步
+ * 
+ * 28BYJ-48 的 64:1 减速齿轮存在 30~80 步的回程间隙.
+ * 换向时前 N 步在"吃间隙", 输出轴不动.
+ * 本函数在换向时临时把目标拉远 backlash 步, 确保间隙吃满后输出轴才开始动.
+ * 副作用: 方向持续不变时误差无影响; 方向切换时位置计数会差 backlash 步,
+ * 这是开环回程差的固有现象, PID 会弥补残余误差.
+ */
+static void PosCtrl_BacklashComp(StepperMotor *motor, int32_t *target,
+                                  Direction *last_dir, int32_t backlash_steps)
+{
+    int32_t err = *target - motor->pos_steps;
+    Direction want_dir;
+    if (err > 4)      want_dir = DIR_CW;
+    else if (err < -4) want_dir = DIR_CCW;
+    else              return;  /* 死区内不触发换向补偿 */
+
+    if (want_dir != *last_dir) {
+        /* 换向: 在目标方向多吃 backlash 步 */
+        if (want_dir == DIR_CW)
+            *target += backlash_steps;
+        else
+            *target -= backlash_steps;
+        /* printf("[%s] 回程差补偿 %+ld 步\n", motor->label, 
+               (long)((want_dir==DIR_CW)?backlash_steps:-backlash_steps)); */
+    }
+    *last_dir = want_dir;
+}
+
 static void PosCtrl_SendTelemetry(void)
 {
     if (HAL_GetTick() - pos_telemetry_tick < 100) return;
@@ -1446,6 +1510,7 @@ static void Gimbal_KeyScan(void)
                 printf("  x<角度> y<角度> 设置目标\r\n");
                 printf("  pid <p|t> <kp|ki|kd> <值> 调PID\r\n");
                 printf("  z 归零  k 切K230  m 切回位置环\r\n");
+                printf("  backlash <p|t> <步数> 调回程差\r\n");
                 break;
         }
         return;
