@@ -305,14 +305,18 @@ static void K230_PID_Init(K230_PID *pid,
 }
 
 /* ---- 速度控制器参数 (v5.0) ----
- *   Kp = 速度增益;  Ki = 减速区宽度(px);  Kd = 接近阻尼(默认0)
+ *   Kp = 速度增益: 越小越柔和, 全速冲刺区= (1/Kp) px
+ *   Ki = 减速区宽度(px): 误差在此区间内速度线性降到 0, 越大越柔
+ *   Kd = 接近阻尼(默认0)
  *   调参口诀: 追得慢→提 Kp; 仍过冲→调大 Ki(减速区)或加 Kd
- */
-#define PAN_GAIN        1.0f    /* Pan 速度增益 */
-#define PAN_DEC_ZONE    35.0f   /* Pan 减速区(px): 误差<35px 时速度线性降为0 */
-#define TILT_GAIN       1.0f    /* Tilt 速度增益 */
-#define TILT_DEC_ZONE   25.0f   /* Tilt 减速区(px) */
-#define CTRL_KD         0.0f    /* 接近阻尼(默认关) */
+ *
+ *   v5.2 调整: Kp 从 1.0 降至 0.005, 让速度在 0~200px 范围内比例变化,
+ *   而非"非全速即停", 配合更宽的减速区实现平滑逼近, 根治过冲振荡. */
+#define PAN_GAIN        0.005f  /* Pan 速度增益: 200px→全速, 100px→50% */
+#define PAN_DEC_ZONE    60.0f   /* Pan 减速区(px): 误差<60px 时速度线性降为0 */
+#define TILT_GAIN       0.004f  /* Tilt 速度增益: 略慢于 Pan */
+#define TILT_DEC_ZONE   50.0f   /* Tilt 减速区(px): 更宽 -> 垂直轴更柔 */
+#define CTRL_KD         0.0005f /* 接近阻尼: 轻微抑制过冲 (原 0.0) */
 #define PID_ILIMIT      20.0f
 #define PID_DEADZONE    2       /* 死区 (像素) — Pan 轴 (收紧, 提升对中精度) */
 #define PID_DEADZONE_TILT 3     /* Tilt 轴死区 (收紧, 与 Pan 接近) */
@@ -447,9 +451,9 @@ static uint32_t g_trace_last_ms = 0;     /* 到角时间戳 */
 static uint32_t g_pos_loststep_start = 0;
 static uint8_t  g_pos_loststep_alarm = 0;
 
-/** @brief 方向反转标志 (上电默认 Pan 反转向, 解决激光正反馈跑出视野) */
+/** @brief 方向反转标志 (上电默认 Pan/Tilt 都需要反转, 解决激光正反馈跑出视野) */
 static uint8_t g_pan_dir_invert = 1;    /* 默认反转, 发 i 命令切换 */
-static uint8_t g_tilt_dir_invert = 0;
+static uint8_t g_tilt_dir_invert = 1;   /* 默认反转, 发 I 命令切换 */
 
 /* ========================== OLED 调试显示缓冲 ========================== */
 static char g_oled_cmd[20];             /* 最近收到的串口命令 (大写, 供 OLED 显示) */
@@ -622,8 +626,11 @@ void USART2_Init(void)
  *   阻塞主循环约 250ms/次 → 控制帧处理被卡 → 云台抖动/命中率下降。
  *   改: 环形缓冲 + TXE 中断续发, 主循环只负责入队, 发送在后台完成。
  *   (对应架构评审 P1-2: 蓝牙/状态发送改非阻塞)
+ *
+ * [v5.2] 增大缓冲区至 512, 防 150ms 高频遥测+CmdReply 并发时溢出丢包.
+ *        BT_SendReport 入队前检查缓冲水位, ≥60% 满时跳帧.
  */
-#define BT_TX_RING_SIZE    256U
+#define BT_TX_RING_SIZE    512U
 static volatile uint8_t  g_bt_tx_ring[BT_TX_RING_SIZE];
 static volatile uint16_t g_bt_tx_head = 0;   /* 写指针(主循环入队) */
 static volatile uint16_t g_bt_tx_tail = 0;   /* 读指针(TXE 中断发送) */
@@ -633,6 +640,13 @@ static volatile uint8_t  g_bt_tx_active = 0; /* 1=TXE 发送进行中 */
 static volatile uint8_t  g_bt_connected    = 0;   /* 收到过蓝牙数据=链路活跃 */
 static volatile uint32_t g_bt_last_rx_tick = 0;   /* 最近一次收到蓝牙数据的 tick */
 #define BT_LINK_LOST_MS   8000U   /* 超过该时间未收到蓝牙数据 → 判定链路断开 */
+
+/** @brief 返回环形缓冲当前已用字节数 (线程不安全, 仅用于水位估计) */
+static uint16_t BT_RingUsed(void)
+{
+    uint16_t h = g_bt_tx_head, t = g_bt_tx_tail;
+    return (h >= t) ? (h - t) : (BT_TX_RING_SIZE - t + h);
+}
 
 /** @brief 若当前未在发送且 ring 有数据, 启动发送(写首字节+使能 TXE 中断) */
 static void BT_UART_Feed(void)
@@ -975,56 +989,13 @@ static void Serial_Execute(void)
     LED_ON();
     CmdReply("\r\n> %s\r\n", s_serial_buf);   /* 回显用户发出的命令 (走蓝牙) */
 
-    /* ---- 单字符命令 (不区分大小写) ---- */
-    switch (*p | 0x20) {
-        case 'p':   /* 选择 Pan 电机 */
+    /* ---- 单字符命令 (区分 i/I 和 p/P, 其余不区分大小写) ---- */
+    switch (*p) {
+        case 'p':   /* 选择 Pan 电机 (小写) */
             g_serial_motor = &g_motor_pan;
             CmdReply("# OK → 选中 Pan 电机 (水平)\r\n");
             return;
-        case 't':   /* 选择 Tilt 电机 */
-            g_serial_motor = &g_motor_tilt;
-            CmdReply("# OK → 选中 Tilt 电机 (垂直)\r\n");
-            return;
-        case 'f':
-            Stepper_SetMode(g_serial_motor, STEP_MODE_FULL);
-            CmdReply("# OK 全步步进 (大力矩)\r\n");
-            return;
-        case 'h':
-            Stepper_SetMode(g_serial_motor, STEP_MODE_HALF);
-            CmdReply("# OK 半步步进 (平滑)\r\n");
-            return;
-        case 'c':   /* 连续正转 */
-            Stepper_SetDirection(g_serial_motor, DIR_CW);
-            Stepper_RunContinuously(g_serial_motor);
-            CmdReply("# OK %s 连续正转 (CW)\r\n", g_serial_motor->label);
-            return;
-        case 'a':   /* 连续反转 */
-            Stepper_SetDirection(g_serial_motor, DIR_CCW);
-            Stepper_RunContinuously(g_serial_motor);
-            CmdReply("# OK %s 连续反转 (CCW)\r\n", g_serial_motor->label);
-            return;
-        case 's':   /* 停止 */
-            Stepper_Stop(g_serial_motor);
-            CmdReply("# OK %s 停止\r\n", g_serial_motor->label);
-            return;
-        case 'd':   /* 进入舞蹈模式 */
-            Stepper_RunContinuously(&g_motor_pan);
-            Stepper_RunContinuously(&g_motor_tilt);
-            g_gimbal_mode = GIMBAL_DANCE;
-            g_dance_phase_start = 0;
-            CmdReply("# OK 进入舞蹈模式 🎵\r\n");
-            return;
-        case 'i':   /* 切换 Pan 方向反转 */
-            g_pan_dir_invert ^= 1;
-            CmdReply("# OK Pan 方向反转: %s\n",
-                   g_pan_dir_invert ? "ON (已反转)" : "OFF (正常)");
-            return;
-        case 'I':   /* 切换 Tilt 方向反转 */
-            g_tilt_dir_invert ^= 1;
-            CmdReply("# OK Tilt 方向反转: %s\n",
-                   g_tilt_dir_invert ? "ON (已反转)" : "OFF (正常)");
-            return;
-        case 'P':   /* 打印速度控制器状态 (保留 Kp=/Ki=/Kd= 格式供上位机解析) */
+        case 'P':   /* 大写 P = 打印 PID 状态 */
             CmdReply("# Pan  PID: Kp=%.3f Ki=%.1f Kd=%.4f\n",
                      g_pid_pan.kp, g_pid_pan.ki, g_pid_pan.kd);
             CmdReply("  deadzone=%d invert=%d\n", PID_DEADZONE, g_pan_dir_invert);
@@ -1032,20 +1003,63 @@ static void Serial_Execute(void)
                      g_pid_tilt.kp, g_pid_tilt.ki, g_pid_tilt.kd);
             CmdReply("  deadzone=%d invert=%d\n", PID_DEADZONE_TILT, g_tilt_dir_invert);
             return;
+        case 't': case 'T':   /* 选择 Tilt 电机 */
+            g_serial_motor = &g_motor_tilt;
+            CmdReply("# OK → 选中 Tilt 电机 (垂直)\r\n");
+            return;
+        case 'f': case 'F':
+            Stepper_SetMode(g_serial_motor, STEP_MODE_FULL);
+            CmdReply("# OK 全步步进 (大力矩)\r\n");
+            return;
+        case 'h': case 'H':
+            Stepper_SetMode(g_serial_motor, STEP_MODE_HALF);
+            CmdReply("# OK 半步步进 (平滑)\r\n");
+            return;
+        case 'c': case 'C':   /* 连续正转 */
+            Stepper_SetDirection(g_serial_motor, DIR_CW);
+            Stepper_RunContinuously(g_serial_motor);
+            CmdReply("# OK %s 连续正转 (CW)\r\n", g_serial_motor->label);
+            return;
+        case 'a': case 'A':   /* 连续反转 */
+            Stepper_SetDirection(g_serial_motor, DIR_CCW);
+            Stepper_RunContinuously(g_serial_motor);
+            CmdReply("# OK %s 连续反转 (CCW)\r\n", g_serial_motor->label);
+            return;
+        case 's': case 'S':   /* 停止 */
+            Stepper_Stop(g_serial_motor);
+            CmdReply("# OK %s 停止\r\n", g_serial_motor->label);
+            return;
+        case 'd': case 'D':   /* 进入舞蹈模式 */
+            Stepper_RunContinuously(&g_motor_pan);
+            Stepper_RunContinuously(&g_motor_tilt);
+            g_gimbal_mode = GIMBAL_DANCE;
+            g_dance_phase_start = 0;
+            CmdReply("# OK 进入舞蹈模式 🎵\r\n");
+            return;
+        case 'i':   /* 小写 i = Pan 方向反转 */
+            g_pan_dir_invert ^= 1;
+            CmdReply("# OK Pan 方向反转: %s\n",
+                   g_pan_dir_invert ? "ON (已反转)" : "OFF (正常)");
+            return;
+        case 'I':   /* 大写 I = Tilt 方向反转 */
+            g_tilt_dir_invert ^= 1;
+            CmdReply("# OK Tilt 方向反转: %s\n",
+                   g_tilt_dir_invert ? "ON (已反转)" : "OFF (正常)");
+            return;
         case '?':
             Stepper_PrintStatus(&g_motor_pan);    /* 详细步进状态→USART1(调试) */
             Stepper_PrintStatus(&g_motor_tilt);
             CmdReply("串口当前选中: %s\r\n", g_serial_motor->label);
             CmdReply("# OK 状态已上报 (详情见调试串口 USART1)\r\n");
             return;
-        case 'g': {   /* 实时调参: g <p|t> <kp|ki|kd> <值> — 上位机 PID 调参面板用 */
+        case 'g': case 'G': {   /* 实时调参: g <p|t> <kp|ki|kd> <值> — 上位机 PID 调参面板用 */
             char axis = 0; char param[4] = {0}; float val = 0;
             if (sscanf(p + 1, "%c %3s %f", &axis, param, &val) == 3) {
                 int isTilt = ((axis | 0x20) == 't');
                 K230_PID *pid = isTilt ? &g_pid_tilt : &g_pid_pan;
-                if      (strcmp(param, "kp") == 0) { if (val<0.1f)val=0.1f; if(val>3.0f)val=3.0f; pid->kp = val; }
-                else if (strcmp(param, "ki") == 0) { if (val<10.0f)val=10.0f; if(val>120.0f)val=120.0f; pid->ki = val; }
-                else if (strcmp(param, "kd") == 0) { if (val<0.0f)val=0.0f; if(val>0.02f)val=0.02f; pid->kd = val; }
+                if      (strcmp(param, "kp") == 0) { if (val<0.001f)val=0.001f; if(val>0.05f)val=0.05f; pid->kp = val; }
+                else if (strcmp(param, "ki") == 0) { if (val<10.0f)val=10.0f; if(val>150.0f)val=150.0f; pid->ki = val; }
+                else if (strcmp(param, "kd") == 0) { if (val<0.0f)val=0.0f; if(val>0.01f)val=0.01f; pid->kd = val; }
                 else { CmdReply("# ERR 未知参数 '%s' (用 kp/ki/kd)\r\n", param); return; }
                 CmdReply("# OK %s %s = %.4f (实时生效, 断电不保存)\r\n",
                          isTilt ? "Tilt" : "Pan", param, (double)val);
@@ -1865,6 +1879,9 @@ static void BT_SendReport(void)
 {
     if (!HAL_IS_BIT_SET(huart2.Instance->CR1, USART_CR1_UE)) return;
 
+    /* [v5.2] 遥测防溢出: 缓冲≥60% 满时跳帧, 避免 CmdReply 发不出 */
+    if (BT_RingUsed() > BT_TX_RING_SIZE * 3 / 5) return;
+
     /* v5.0 速度指令代理 = Kp·误差 (限幅 ±1), 供上位机 PID 曲线绘制 */
     float p_pid = g_pid_pan.kp * g_k230_err_x;
     float t_pid = g_pid_tilt.kp * g_k230_err_y;
@@ -1888,19 +1905,31 @@ static void BT_SendReport(void)
     }
 }
 
+/** @brief 将 GimbalMode 枚举映射为可显示字符串 (安全, 无越界) */
+static const char* ModeName(GimbalMode mode)
+{
+    switch (mode) {
+        case GIMBAL_PAN:     return "PAN";
+        case GIMBAL_TILT:    return "TILT";
+        case GIMBAL_SWEEP:   return "SWEEP";
+        case GIMBAL_SERIAL:  return "SERIAL";
+        case GIMBAL_DANCE:   return "DANCE";
+        case GIMBAL_AUTO:    return "AUTO";
+        case GIMBAL_POSCTRL: return "POS";
+        case GIMBAL_TRACE:   return "TRACE";
+        default:             return "???";
+    }
+}
+
 /** @brief 收集当前云台状态并刷新到 OLED (无 OLED 时直接返回) */
 static void OLED_Refresh(void)
 {
     if (!OLED_Debug_IsReady()) return;
 
-    static const char *mode_names[6] = {
-        "PAN", "TILT", "SWEEP", "SERIAL", "DANCE", "AUTO"
-    };
-
     OledDebugInfo info;
     memset(&info, 0, sizeof(info));
 
-    info.mode = mode_names[g_gimbal_mode];
+    info.mode = ModeName(g_gimbal_mode);
     info.k230_mode = (g_gimbal_mode == GIMBAL_AUTO) ? 1 : 0;
     snprintf(info.bt_line, sizeof(info.bt_line), "BT:%s",
              g_bt_connected ? "ON " : "LOST");
@@ -2164,6 +2193,11 @@ void TIM3_IRQHandler(void)
  */
 void USART1_IRQHandler(void)
 {
+    /* 先清除溢出错误 (ORE 置位时 RXNE 读到的是脏数据) */
+    if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE) != RESET) {
+        __HAL_UART_CLEAR_OREFLAG(&huart1);
+    }
+
     if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE) != RESET) {
         uint8_t byte = (uint8_t)(huart1.Instance->DR & 0xFF);
 
@@ -2179,11 +2213,6 @@ void USART1_IRQHandler(void)
             s_cmd_ready = 1;
         }
     }
-
-    /* 清除溢出错误 */
-    if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE) != RESET) {
-        __HAL_UART_CLEAR_OREFLAG(&huart1);
-    }
 }
 
 /**
@@ -2194,6 +2223,12 @@ void USART1_IRQHandler(void)
  */
 void USART2_IRQHandler(void)
 {
+    /* ---- 错误先清除: ORE/NE/FE/PE 必须优先处理, 否则 RXNE 可能读到脏数据 ---- */
+    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_ORE) != RESET) __HAL_UART_CLEAR_OREFLAG(&huart2);
+    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_NE)  != RESET) { volatile uint8_t tmp __attribute__((unused)) = (uint8_t)(huart2.Instance->DR & 0xFF); }
+    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_FE)  != RESET) { volatile uint8_t tmp __attribute__((unused)) = (uint8_t)(huart2.Instance->DR & 0xFF); }
+    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_PE)  != RESET) { volatile uint8_t tmp __attribute__((unused)) = (uint8_t)(huart2.Instance->DR & 0xFF); }
+
     /* ---- TXE: 续发 ring 中剩余字节 ---- */
     if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_TXE) != RESET &&
         __HAL_UART_GET_IT_SOURCE(&huart2, UART_IT_TXE) != RESET) {
@@ -2225,12 +2260,6 @@ void USART2_IRQHandler(void)
             s_bt_cmd_ready = 1;
         }
     }
-
-    /* ---- 错误恢复: 清 ORE/NE/FE/PE, 防止 UART 卡死导致后续再也收不到数据 ---- */
-    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_ORE) != RESET) __HAL_UART_CLEAR_OREFLAG(&huart2);
-    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_NE)  != RESET) __HAL_UART_CLEAR_NEFLAG(&huart2);
-    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_FE)  != RESET) __HAL_UART_CLEAR_FEFLAG(&huart2);
-    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_PE)  != RESET) __HAL_UART_CLEAR_PEFLAG(&huart2);
 }
 
 /**

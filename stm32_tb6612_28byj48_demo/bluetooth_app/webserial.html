@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>云台调参上位机 · 28BYJ-48</title>
+<title>云台调参上位机 v5.2 · 28BYJ-48</title>
 <style>
   :root {
     --bg: #0a0e1a; --card: #151b2e; --accent: #00e5ff; --accent2: #b14bff;
@@ -90,13 +90,14 @@
   .axis-title.tilt { color: var(--ch2); }
   .tune-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
   .tune-row .lab { width: 26px; font-size: 11px; color: var(--muted); }
-  .tune-row .val { width: 64px; text-align: right; font-variant-numeric: tabular-nums;
+  .tune-row .val { width: 72px; text-align: right; font-variant-numeric: tabular-nums;
     font-size: 12px; color: var(--ok); font-weight: 600; }
+  .tune-row .unit { font-size: 10px; color: var(--muted); width: 24px; }
 </style>
 </head>
 <body>
 
-<h1>🎯 <span>云台调参上位机</span> · 28BYJ-48 / K230 打靶</h1>
+<h1>🎯 <span>云台调参上位机 v5.2</span> · 28BYJ-48 / K230 打靶</h1>
 
 <div class="app">
 
@@ -113,68 +114,87 @@
     <div class="row" style="margin-top:6px;gap:4px">
       <select id="baudSelect" style="width:96px">
         <option value="9600" selected>9600</option>
-        <option value="19200">19200</option>
-        <option value="38400">38400</option>
-        <option value="57600">57600</option>
         <option value="115200">115200</option>
       </select>
       <button class="btn primary" id="connectBtn">连接串口</button>
       <button class="btn danger" id="disconnectBtn" style="display:none">断开</button>
     </div>
-    <div class="hint">CH340 接 STM32 的 <b>USART2(蓝牙口)</b> @9600 — K230 遥测帧由此输出，曲线/调参才有效；若接 USART1(调试口 115200) 只能收发命令、看不到曲线。</div>
+    <div class="hint">CH340 接 <b>USART2(蓝牙口) @9600</b> 才能收 K230 遥测看曲线；接 USART1 只能收发命令。</div>
   </div>
 
   <!-- 手动控制 -->
   <div class="card">
     <div class="section">🎮 云台手动控制 <span class="badge">切串口模式</span></div>
     <div class="row" style="gap:4px;margin-bottom:6px">
-      <button class="btn sm toggle-on" id="axisPan">水平 Pan</button>
-      <button class="btn sm" id="axisTilt">俯仰 Tilt</button>
-    </div>
-    <div class="row" style="margin-bottom:6px">
+      <button class="btn sm toggle-on" id="axisPan">Pan</button>
+      <button class="btn sm" id="axisTilt">Tilt</button>
       <button class="btn sm" data-cmd="c">▶ 正转</button>
       <button class="btn sm" data-cmd="a">◀ 反转</button>
       <button class="btn sm" data-cmd="s">⏹ 停止</button>
     </div>
     <div class="row wrap" style="gap:3px">
-      <button class="btn sm" data-cmd="+100">+100步</button>
-      <button class="btn sm" data-cmd="-100">-100步</button>
       <button class="btn sm" data-cmd="r45">转45°</button>
       <button class="btn sm" data-cmd="r90">转90°</button>
-      <button class="btn sm" data-cmd="p w90">扫描±90</button>
+      <button class="btn sm" data-cmd="+100">+100步</button>
+      <button class="btn sm" data-cmd="-100">-100步</button>
+      <button class="btn sm" data-cmd="i">反Pan</button>
+      <button class="btn sm" data-cmd="I">反Tilt</button>
       <button class="btn sm" data-cmd="h">半步</button>
       <button class="btn sm" data-cmd="f">全步</button>
-      <button class="btn sm" data-cmd="i">反转Pan</button>
-      <button class="btn sm" data-cmd="I">反转Tilt</button>
     </div>
     <div class="row" style="margin-top:8px">
       <span style="font-size:11px;color:var(--muted)">速度</span>
       <input type="range" id="speed" min="1300" max="10000" value="3000" step="100">
       <span class="speed-val" id="speedVal">3000µs</span>
     </div>
-    <div class="hint">点命令会切到“串口模式”，打断自动打靶；K230 再发帧即自动恢复 AUTO。</div>
+    <div class="hint">K230 再发帧即自动恢复 AUTO 模式。</div>
   </div>
 
-  <!-- PID 实时调参 -->
+  <!-- PID 实时调参 — v5.2 新参数范围 -->
   <div class="card">
-    <div class="section">🎛 实时 PID 调参
+    <div class="section">🎛 速度环 PID (K230 自动打靶)
       <button class="btn sm primary" id="readPidBtn" style="margin-left:auto">读取当前</button>
     </div>
+    <p style="font-size:10px;color:var(--warn);margin:0 0 6px">Kp 越小越柔和 · Ki 减速区越大越不冲 · Kd 阻尼抑过冲</p>
 
     <div class="axis-block">
       <div class="axis-title">Pan 水平轴</div>
-      <div class="tune-row"><span class="lab">增益Kp</span><input type="range" data-axis="p" data-param="kp" min="0.1" max="3" step="0.05" value="1.0"><span class="val" id="kp_p_v">1.000</span></div>
-      <div class="tune-row"><span class="lab">减速区Ki</span><input type="range" data-axis="p" data-param="ki" min="10" max="120" step="1" value="35"><span class="val" id="ki_p_v">35</span></div>
-      <div class="tune-row"><span class="lab">阻尼Kd</span><input type="range" data-axis="p" data-param="kd" min="0" max="0.01" step="0.0005" value="0"><span class="val" id="kd_p_v">0.0000</span></div>
+      <div class="tune-row">
+        <span class="lab">Kp</span>
+        <input type="range" data-axis="p" data-param="kp" min="0.001" max="0.05" step="0.001" value="0.005">
+        <span class="val" id="kp_p_v">0.005</span><span class="unit">/px</span>
+      </div>
+      <div class="tune-row">
+        <span class="lab">Ki</span>
+        <input type="range" data-axis="p" data-param="ki" min="10" max="150" step="1" value="60">
+        <span class="val" id="ki_p_v">60</span><span class="unit">px</span>
+      </div>
+      <div class="tune-row">
+        <span class="lab">Kd</span>
+        <input type="range" data-axis="p" data-param="kd" min="0" max="0.01" step="0.0005" value="0.0005">
+        <span class="val" id="kd_p_v">0.0005</span><span class="unit">·s</span>
+      </div>
     </div>
 
     <div class="axis-block">
       <div class="axis-title tilt">Tilt 俯仰轴</div>
-      <div class="tune-row"><span class="lab">增益Kp</span><input type="range" data-axis="t" data-param="kp" min="0.1" max="3" step="0.05" value="1.0"><span class="val" id="kp_t_v">1.000</span></div>
-      <div class="tune-row"><span class="lab">减速区Ki</span><input type="range" data-axis="t" data-param="ki" min="10" max="120" step="1" value="25"><span class="val" id="ki_t_v">25</span></div>
-      <div class="tune-row"><span class="lab">阻尼Kd</span><input type="range" data-axis="t" data-param="kd" min="0" max="0.01" step="0.0005" value="0"><span class="val" id="kd_t_v">0.0000</span></div>
+      <div class="tune-row">
+        <span class="lab">Kp</span>
+        <input type="range" data-axis="t" data-param="kp" min="0.001" max="0.05" step="0.001" value="0.004">
+        <span class="val" id="kp_t_v">0.004</span><span class="unit">/px</span>
+      </div>
+      <div class="tune-row">
+        <span class="lab">Ki</span>
+        <input type="range" data-axis="t" data-param="ki" min="10" max="150" step="1" value="50">
+        <span class="val" id="ki_t_v">50</span><span class="unit">px</span>
+      </div>
+      <div class="tune-row">
+        <span class="lab">Kd</span>
+        <input type="range" data-axis="t" data-param="kd" min="0" max="0.01" step="0.0005" value="0.0005">
+        <span class="val" id="kd_t_v">0.0005</span><span class="unit">·s</span>
+      </div>
     </div>
-    <div class="hint">拖动滑块即实时下发 <code>g &lt;轴&gt; &lt;参数&gt; &lt;值&gt;</code>，断电不保存。<b>Kp=速度增益</b>(追得慢就调大)；<b>Ki=减速区(px)</b>(仍过冲靶心就调大，让接近更柔和)；<b>Kd=阻尼</b>(0=关，过冲严重时加 0.002~0.005)。</div>
+    <div class="hint">拖动即下发 <code>g &lt;轴&gt; &lt;参数&gt; &lt;值&gt;</code>。<br>追得慢→提 Kp · 仍过冲→加 Ki 或 Kd · 先调 Pan 再调 Tilt。</div>
   </div>
 
 </div>
@@ -190,20 +210,25 @@
       <span class="l">Tilt 误差</span><span class="v c" id="tTiltErr">--</span>
       <span class="l">PID_P 输出</span><span class="v" id="tPidP">--</span>
       <span class="l">PID_T 输出</span><span class="v" id="tPidT">--</span>
+      <span class="l">减速区 Pan</span><span class="v" id="tDecP">--</span>
+      <span class="l">减速区 Tilt</span><span class="v" id="tDecT">--</span>
       <span class="l">命中</span><span class="v" id="tHit">--</span>
       <span class="l">模式</span><span class="v" id="tMode">--</span>
     </div>
   </div>
 
-  <!-- PID 实时曲线 -->
+  <!-- PID 实时曲线 (双轴: 误差px + PID输出) -->
   <div class="card">
     <div class="section">
       📈 PID 实时曲线
       <span class="badge" id="chartPoints">0 点</span>
-      <label style="margin-left:auto;font-size:11px;color:var(--muted);display:flex;align-items:center;gap:4px">
-        <input type="checkbox" id="pauseChart"> 暂停
-        <button class="btn sm" id="clearChart" style="margin-left:6px">清零</button>
-      </label>
+      <span style="margin-left:auto;display:flex;align-items:center;gap:6px">
+        <label style="font-size:11px;color:var(--muted);display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="pauseChart"> 暂停
+        </label>
+        <button class="btn sm" id="clearChart">清零</button>
+        <button class="btn sm" id="chartModeBtn">跟踪</button>
+      </span>
     </div>
     <div class="chart-wrap"><canvas id="pidChart"></canvas></div>
     <div class="chart-legend">
@@ -211,8 +236,9 @@
       <span><span class="legend-dot" style="background:var(--ch2)"></span> Tilt误差</span>
       <span><span class="legend-dot" style="background:var(--ch3)"></span> PID_P</span>
       <span><span class="legend-dot" style="background:var(--ch4)"></span> PID_T</span>
+      <span id="chartTimeRange" style="margin-left:auto;font-size:10px;color:var(--muted)"></span>
     </div>
-    <div class="axis-note">左轴 = 误差(px，青/红) · 右轴 = PID输出(±1，绿/黄)</div>
+    <div class="axis-note">左轴(青/红) = 误差 px · 右轴(绿/黄) = PID 输出 ±1 · 带末尾值标签</div>
   </div>
 
   <!-- 串口监视 -->
@@ -223,8 +249,16 @@
     </div>
     <div class="term" id="term"></div>
     <div class="cmd-row">
-      <input type="text" id="cmdInput" placeholder="自定义命令… 例: P / ? / g p kp 0.02" spellcheck="false">
+      <input type="text" id="cmdInput" placeholder="自定义命令… 例: P / ? / g p kp 0.01" spellcheck="false">
       <button class="btn sm primary" id="sendCmdBtn">发送</button>
+      <select id="cmdPreset" onchange="if(this.value)send(this.value)">
+        <option value="">📋 快捷</option>
+        <option value="?">? 状态</option>
+        <option value="P">P 查PID</option>
+        <option value="k">k K230</option>
+        <option value="m">m 位置环</option>
+        <option value="z">z 归零</option>
+      </select>
     </div>
   </div>
 
@@ -232,12 +266,14 @@
 </div>
 
 <script>
-/* ===================== PID 曲线引擎 (双轴: 误差px / PID输出±1) ===================== */
-const CHART_MAX = 300;
-const chartData = { panErr: [], tiltErr: [], pidP: [], pidT: [] };
+/* ===================== PID 曲线引擎 (增强版) ===================== */
+const CHART_MAX = 400;
+const chartData = { panErr: [], tiltErr: [], pidP: [], pidT: [], time: [] };
 let chartPaused = false;
+let chartAutoScroll = true; /* true=窗口跟随最新数据滚动 */
 const canvas = document.getElementById('pidChart');
 const ctx = canvas.getContext('2d');
+let chartAnim = null; /* 动画节流 */
 
 function resizeCanvas() {
   const rect = canvas.parentElement.getBoundingClientRect();
@@ -260,8 +296,21 @@ function pushChartData(panErr, tiltErr, pidP, pidT) {
   push(chartData.tiltErr, tiltErr);
   push(chartData.pidP, pidP);
   push(chartData.pidT, pidT);
+  chartData.time.push(Date.now());
+  if (chartData.time.length > CHART_MAX) chartData.time.shift();
   document.getElementById('chartPoints').textContent = chartData.panErr.length + ' 点';
-  drawChart();
+
+  /* 动画节流: 最多 30fps */
+  if (!chartAnim) {
+    chartAnim = requestAnimationFrame(() => { chartAnim = null; drawChart(); });
+  }
+}
+
+function formatTime(ts) {
+  const d = new Date(ts);
+  return d.getMinutes().toString().padStart(2,'0') + ':' +
+         d.getSeconds().toString().padStart(2,'0') + '.' +
+         (d.getMilliseconds()/100).toFixed(0);
 }
 
 function drawChart() {
@@ -277,68 +326,82 @@ function drawChart() {
     ctx.fillText('等待 K230 遥测…', w/2, h/2); return;
   }
 
-  // 误差量程(左轴)
+  /* 动态量程 (误差左轴) */
   let errMax = 5;
   for (const v of chartData.panErr) errMax = Math.max(errMax, Math.abs(v));
   for (const v of chartData.tiltErr) errMax = Math.max(errMax, Math.abs(v));
-  const mag = Math.pow(10, Math.floor(Math.log10(errMax)));
-  errMax = Math.ceil(errMax / mag) * mag;
-  const pidMax = 1.0; // PID 输出限幅 ±1
+  errMax = Math.ceil(errMax / 5) * 5;  /* 5px 量化粒度 */
+  if (errMax < 5) errMax = 5;
+  const pidMax = 1.0;
 
   const errY = v => pad.t + ((v + errMax) / (2 * errMax)) * ph;
   const pidY = v => pad.t + ((v + pidMax) / (2 * pidMax)) * ph;
 
-  // 网格 + 双轴标尺
-  const gridLines = 4;
+  /* 网格 + 双轴标尺 */
+  const gridLines = 5;
   ctx.font = '9px monospace';
   for (let i = 0; i <= gridLines; i++) {
     const y = pad.t + (i / gridLines) * ph;
     ctx.strokeStyle = (i === gridLines/2) ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.05)';
     ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y); ctx.stroke();
-    // 左轴(误差)
+    /* 左轴(误差) */
     const ev = errMax - (i / gridLines) * (2 * errMax);
     ctx.fillStyle = '#4a5568'; ctx.textAlign = 'right';
     ctx.fillText(Math.round(ev), pad.l - 4, y + 3);
-    // 右轴(PID)
+    /* 右轴(PID) */
     const pv = pidMax - (i / gridLines) * (2 * pidMax);
     ctx.textAlign = 'left';
     ctx.fillText(pv.toFixed(1), w - pad.r + 4, y + 3);
   }
-  // 零位标线
+  /* 零位标线 */
   const zeroY = pad.t + ph / 2;
   ctx.strokeStyle = 'rgba(255,255,255,0.10)'; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(pad.l, zeroY); ctx.lineTo(w - pad.r, zeroY); ctx.stroke();
 
-  // 数据线
+  /* 时间轴标尺 */
+  const tStart = chartData.time[0], tEnd = chartData.time[n - 1];
+  const span = Math.max(1000, tEnd - tStart);
+  document.getElementById('chartTimeRange').textContent =
+    `⌛ ${(span/1000).toFixed(0)}s 窗口 (${chartAutoScroll ? '跟踪' : '固定'})`;
+  /* 底部时间标签 */
+  ctx.font = '8px monospace'; ctx.fillStyle = '#3a4455'; ctx.textAlign = 'center';
+  const tStep = Math.max(1, Math.floor(span / 4000) * 1000);
+  for (let t = Math.ceil(tStart / tStep) * tStep; t <= tEnd; t += tStep) {
+    const frac = (t - tStart) / span;
+    const x = pad.l + frac * pw;
+    ctx.fillText(formatTime(t), x, h - 3);
+  }
+
+  /* 数据序列 */
   const series = [
-    { key: 'panErr', color: '#00e5ff', y: errY },
-    { key: 'tiltErr', color: '#ff4d6d', y: errY },
-    { key: 'pidP', color: '#00ff88', y: pidY },
-    { key: 'pidT', color: '#ffd93d', y: pidY },
+    { key: 'panErr', color: '#00e5ff', y: errY, dec: 0 },
+    { key: 'tiltErr', color: '#ff4d6d', y: errY, dec: 0 },
+    { key: 'pidP', color: '#00ff88', y: pidY, dec: 3 },
+    { key: 'pidT', color: '#ffd93d', y: pidY, dec: 3 },
   ];
   for (const s of series) {
     const data = chartData[s.key];
     if (data.length < 2) continue;
-    const step = pw / (data.length - 1);
     ctx.strokeStyle = s.color; ctx.lineWidth = 1.5;
     ctx.beginPath();
     for (let i = 0; i < data.length; i++) {
-      const x = pad.l + i * step, y = s.y(data[i]);
+      const frac = (chartData.time[i] - tStart) / span;
+      const x = pad.l + frac * pw, y = s.y(data[i]);
       i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
     }
     ctx.stroke();
-    // 末端标签
+    /* 末端标签 */
     const last = data[data.length - 1];
-    const lx = pad.l + (data.length - 1) * step;
-    const ly = s.y(last);
+    const lf = (chartData.time[n - 1] - tStart) / span;
+    const lx = pad.l + lf * pw, ly = s.y(last);
     ctx.fillStyle = s.color; ctx.font = '9px monospace'; ctx.textAlign = 'left';
-    const txt = s.key.endsWith('Err') ? last.toFixed(0) : last.toFixed(2);
-    ctx.fillText(txt, Math.min(lx + 4, w - pad.r - 36), Math.max(ly - 4, pad.t + 9));
+    const txt = last.toFixed(s.dec);
+    ctx.fillText(txt, Math.min(lx + 4, w - pad.r - 32), Math.max(ly - 4, pad.t + 9));
   }
 }
 
-/* ===================== Web Serial (CH340 鲁棒连接) ===================== */
+/* ===================== Web Serial ===================== */
 let port = null, reader = null, keepReading = false;
 const enc = new TextEncoder(), dec = new TextDecoder();
 const $ = id => document.getElementById(id);
@@ -347,6 +410,7 @@ const connectBtn = $('connectBtn'), disconnectBtn = $('disconnectBtn'), baudSele
 const term = $('term'), cmdInput = $('cmdInput'), echoCount = $('echoCount');
 const speed = $('speed'), speedVal = $('speedVal');
 let lineCount = 0, lastPidAxis = '';
+let lastK230Line = ''; /* 用于去重 */
 
 function log(msg, color) {
   const line = document.createElement('div');
@@ -377,24 +441,29 @@ function parseReport(line) {
   const tiltErr = parseInt(m.T) || 0;
   const pidP = parseFloat(m.PP) || 0;
   const pidT = parseFloat(m.PT) || 0;
+  const decP = parseFloat(m.I) || 0;  /* ki 字段 = 减速区 */
+  const decT = parseFloat(m.J) || 0;
   const hit = m.H === '1';
   const mode = m.S;
 
   $('trackCard').style.display = 'block';
-  $('tPanErr').textContent = panErr + 'px';
+  $('trackMode').textContent = mode === 'A' ? 'AUTO 🎯' : (mode === 'M' ? 'MANUAL' : '--');
+  $('tPanErr').textContent = (panErr > 0 ? '+' : '') + panErr + 'px';
   $('tPanErr').className = 'v c' + (Math.abs(panErr) > 10 ? ' e' : '');
-  $('tTiltErr').textContent = tiltErr + 'px';
+  $('tTiltErr').textContent = (tiltErr > 0 ? '+' : '') + tiltErr + 'px';
   $('tTiltErr').className = 'v c' + (Math.abs(tiltErr) > 10 ? ' e' : '');
   $('tPidP').textContent = pidP.toFixed(3);
   $('tPidT').textContent = pidT.toFixed(3);
-  $('tHit').textContent = hit ? 'YES' : 'no';
+  $('tDecP').textContent = decP.toFixed(0) + 'px';
+  $('tDecT').textContent = decT.toFixed(0) + 'px';
+  $('tHit').textContent = hit ? 'YES ✓' : 'no';
   $('tHit').className = 'v' + (hit ? ' h' : '');
   $('tMode').textContent = mode === 'A' ? 'AUTO' : 'MAN';
 
   pushChartData(panErr, tiltErr, pidP, pidT);
 }
 
-/* ---- P 命令回显解析 (读取当前 PID 增益填入滑块) ---- */
+/* ---- P 回显解析: 读取当前 PID 填入滑块 ---- */
 function parsePidReply(line) {
   if (line.includes('Pan') && line.includes('PID')) lastPidAxis = 'p';
   else if (line.includes('Tilt') && line.includes('PID')) lastPidAxis = 't';
@@ -409,12 +478,15 @@ function setSlider(axis, param, val) {
   const el = document.querySelector(`input[data-axis="${axis}"][data-param="${param}"]`);
   if (!el) return;
   el.value = val;
-  $(`${param}_${axis}_v`).textContent = val.toFixed(4);
+  const display = $(`${param}_${axis}_v`);
+  if (display) display.textContent = val.toFixed(param === 'ki' ? 0 : 4);
+  /* 触发 input 事件更新显示 */
+  el.dispatchEvent(new Event('input'));
 }
 
 async function connect() {
   if (!('serial' in navigator)) { log('⚠ 浏览器不支持 Web Serial，请用 Chrome / Edge', '#ff4d6d'); return; }
-  if (port) { try { await disconnect(); } catch(_) {} }   // 已连则先清理, 保证可重连
+  if (port) { try { await disconnect(); } catch(_) {} }
   try {
     port = await navigator.serial.requestPort();
     const info = port.getInfo();
@@ -422,7 +494,7 @@ async function connect() {
       ? `USB ${info.usbVendorId.toString(16)}:${info.usbProductId.toString(16)}` : '';
     await port.open({ baudRate: parseInt(baudSelect.value, 10) });
     keepReading = true;
-    log(`串口已打开 ✓ 波特率 ${baudSelect.value}`);
+    log(`串口已打开 ✓ ${baudSelect.value} baud`);
     setConnected(true);
     readLoop();
   } catch (e) { log('连接失败: ' + e.message, '#ff4d6d'); port = null; }
@@ -447,9 +519,16 @@ function handleData(value) {
   for (const raw of str.split('\n')) {
     const l = raw.trim();
     if (!l) continue;
-    log(l);
-    if (l.startsWith('K230,')) parseReport(l);
-    else parsePidReply(l);
+    /* K230 遥测去重 (同样的行连续出现时不重复 log) */
+    if (l.startsWith('K230,')) {
+      if (l !== lastK230Line) log(l);
+      lastK230Line = l;
+      parseReport(l);
+    } else {
+      lastK230Line = '';
+      log(l);
+      parsePidReply(l);
+    }
   }
 }
 
@@ -465,14 +544,13 @@ async function send(cmd) {
 async function disconnect() {
   keepReading = false;
   if (reader) { try { await reader.cancel(); } catch(_) {} }
-  // 关键: 必须等 reader 释放锁后再关端口, 否则 CH340 下次无法重连
   let guard = 0;
   while (reader && guard++ < 200) await new Promise(r => setTimeout(r, 10));
   if (port) { try { await port.close(); } catch(_) {} port = null; }
   setConnected(false); portInfo.textContent = ''; log('已断开');
 }
 
-// 物理断开(CH340 拔出)自动复位状态
+/* CH340 物理拔出自动复位 */
 if ('serial' in navigator) {
   navigator.serial.addEventListener('disconnect', async (e) => {
     if (port && e.target === port) {
@@ -492,36 +570,43 @@ disconnectBtn.onclick = disconnect;
 document.querySelectorAll('[data-cmd]').forEach(b => { b.onclick = () => send(b.dataset.cmd); });
 $('clearBtn').onclick = () => { term.innerHTML = ''; lineCount = 0; echoCount.textContent = '0'; };
 $('sendCmdBtn').onclick = () => { const v = cmdInput.value.trim(); if (v) { send(v); cmdInput.value = ''; } };
-cmdInput.onkeydown = e => { if (e.key === 'Enter') { const v = cmdInput.value.trim(); if (v) { send(v); cmdInput.value = ''; } e.preventDefault(); } };
+cmdInput.onkeydown = e => {
+  if (e.key === 'Enter') { const v = cmdInput.value.trim(); if (v) { send(v); cmdInput.value = ''; } e.preventDefault(); }
+};
 
 speed.oninput = () => { speedVal.textContent = speed.value + 'µs'; };
 speed.onchange = () => { send('v' + speed.value); };
 
-$('axisPan').onclick = () => { send('p'); setActiveAxis('p'); };
-$('axisTilt').onclick = () => { send('t'); setActiveAxis('t'); };
-function setActiveAxis(a) {
-  $('axisPan').className = 'btn sm' + (a === 'p' ? ' toggle-on' : '');
-  $('axisTilt').className = 'btn sm' + (a === 't' ? ' toggle-on' : '');
-}
+$('axisPan').onclick = () => { send('p'); $('axisPan').className = 'btn sm toggle-on'; $('axisTilt').className = 'btn sm'; };
+$('axisTilt').onclick = () => { send('t'); $('axisTilt').className = 'btn sm toggle-on'; $('axisPan').className = 'btn sm'; };
 
-// PID 调参滑块: 实时下发 g 命令
+/* PID 调参滑块: input 实时显示, change 才发送(防刷爆) */
 document.querySelectorAll('.tune-row input[type=range]').forEach(s => {
   const lab = $(`${s.dataset.param}_${s.dataset.axis}_v`);
   s.addEventListener('input', () => {
     const v = parseFloat(s.value);
-    lab.textContent = v.toFixed(4);
+    lab.textContent = s.dataset.param === 'ki' ? v.toFixed(0) : v.toFixed(4);
+  });
+  s.addEventListener('change', () => {
+    const v = parseFloat(s.value);
     send(`g ${s.dataset.axis} ${s.dataset.param} ${v.toFixed(4)}`);
   });
 });
-$('readPidBtn').onclick = () => { lastPidAxis = ''; send('P'); };  // 回显解析后填入滑块
+$('readPidBtn').onclick = () => { lastPidAxis = ''; send('P'); };
 
-$('pauseChart').onchange = function () { chartPaused = this.checked; };
+/* 曲线控制 */
+$('pauseChart').onchange = function () { chartPaused = this.checked; if (!chartPaused) drawChart(); };
 $('clearChart').onclick = () => {
   chartData.panErr.length = 0; chartData.tiltErr.length = 0;
-  chartData.pidP.length = 0; chartData.pidT.length = 0;
+  chartData.pidP.length = 0; chartData.pidT.length = 0; chartData.time.length = 0;
   drawChart();
 };
+$('chartModeBtn').onclick = function () {
+  chartAutoScroll = !chartAutoScroll;
+  this.textContent = chartAutoScroll ? '跟踪' : '固定';
+};
 
+/* 初始渲染 */
 if (!('serial' in navigator)) {
   log('⚠ 当前浏览器不支持 Web Serial，请用 Chrome / Edge 打开', '#ff4d6d');
   connectBtn.disabled = true;
