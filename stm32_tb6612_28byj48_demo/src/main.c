@@ -953,6 +953,14 @@ static void Serial_Execute(void)
         return;
     }
 
+    /* ---- K230 自动打靶模式: 锁定模式, 忽略串口误触 ----
+     * 防止 CH340/蓝牙的 stray 字节把模式从 AUTO 踢出,
+     * 导致 [K230] → 自动打靶 反复切进切出. */
+    if (g_gimbal_mode == GIMBAL_AUTO) {
+        CmdReply("# AUTO 忽略: %s\r\n", s_serial_buf);
+        return;
+    }
+
     /* ---- 串口接管 + 视觉反馈 ----
      * 其他串口命令先把云台切到 SERIAL 模式, 避免被 Pan/Sweep/Dance 的主循环逻辑覆盖；
      * 同时让板载 LED 亮 150ms，给出明确的"已收到"视觉反馈。 */
