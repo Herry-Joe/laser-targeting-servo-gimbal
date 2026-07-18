@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =============================================================
-# 庐山派 K230 - 激光打靶追踪 v4.15 (无激光不发误差+反光拒识)
+# 庐山派 K230 - 激光打靶追踪 v4.16 (合并激光阈值+帧间限速+柔EMA)
 #
 # 核心思路:
 #   YOLO 检测圆靶 (主力, 每 3 帧) + 矩形边框 (仅兜底, 每 12 帧)
@@ -415,7 +415,7 @@ def run():
         last_tgt_ms=0; tgt_xh=0; tgt_yh=0  # v4.13: 目标保持状态(空窗期沿用上次靶心)
 
         fc=0; yolo_skip=YOLO_SKIP_FRAMES-1; yolo_stale=99; yolo_ok=False; yx=0; yy=0
-        print("=== v4.15 无激光拒识+反光过滤+debug输出 ===")
+        print("=== v4.16 合并激光阈值+帧间限速+柔EMA ===")
         print("Model:", labels[0], "conf=%.2f  YOLO=1/%df  Rect=1/%df  Laser=multi+roi+qc" %
               (conf_th, YOLO_SKIP_FRAMES, RECT_SKIP_FRAMES))
 
