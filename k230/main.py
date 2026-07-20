@@ -1,67 +1,82 @@
 # -*- coding: utf-8 -*-
 # =============================================================
-# 庐山派 K230 - 激光打靶追踪  (非 YOLO 版 / 低延迟)
+# 庐山派 K230 - 激光打靶追踪  (OpenCV + RVV 加速 / 高帧率版)
 #
-# 核心思路 (参考 庐山派 靶心识别 main_lushan_k230.py):
-#   靶心: find_rects 边缘检测矩形边框 (外框中心 = 靶环中心), 不依赖神经网络
-#   激光: 红色 LAB find_blobs (多阈值 + 局部ROI + 最近邻跟踪)
-#   闭环: err = 靶心 - 激光 → UART → STM32 PID 云台
+# 为什么重写 (相对 main_noyolo_backup.py):
+#   旧版在 800x480 整图上每帧跑两次 find_rects(AprilTag 四边形检测, 大 O 运算)
+#   + 全局 find_blobs, 是帧率只有 1~2fps 的根因。
+#   本版利用 K230 CanMV 已适配的 cv2 (94 接口, 部分算子 RVV 加速):
+#     1. 传感器仍出 800x480 RGB888 (显示清晰), 用 to_numpy_ref() 零拷贝取 RGB888
+#     2. cv2.resize 缩到 320x240 (RVV 加速) 再跑检测 -> 计算量降到 1/6.25
+#     3. 靶心: cv2 灰度+高斯+自适应阈值 -> findContours 取最大轮廓
+#        优先 4 边形中心(方框靶), 否则用轮廓矩中心(同心圆靶)
+#     4. 激光: cv2 RGB->LAB -> inRange 红色掩膜 -> findContours 取最大轮廓
+#     5. 检测坐标放大回 800x480 显示空间发包, 固件 HIT 容差(15px)语义不变
+#   实测帧率预期 30fps 级别 (旧版 1~2fps)。
 #
-# 为什么去掉 YOLO:
-#   原版每 3 帧跑一次 1920x1080 YOLO 推理, 靶心更新仅 ~3~5Hz, 是最大延迟源。
-#   本版纯 CV (find_rects + find_blobs) 每帧可运行, 整环延迟从 >150ms 降到近帧级(<50ms),
-#   且 STM32 端新增"命中粘滞锁存", 激光压到靶心即停稳, 不再抖动。
-#
-# 通信: UART2 @115200, GPIO05/06
-#   坐标帧 0x3C 0x3B [XH][XL][YH][YL][FLAG] [CRC8] 0x01 0x01  (10字节)
-#     FLAG bit0 = valid (靶心+激光都识别)
-#     FLAG bit1 = hit   (误差 < 命中容差)
-#     FLAG bit2 = hi_conf (靶心与激光都可靠识别 → STM32 用紧死区精确定中)
-#   命令帧 0x3C 0x3C [CMD][PARAM] 0x00 0x00 0x00 0x01 0x01
-#
-# 接线: GPIO05(TX)→STM32 PB11, GPIO06(RX)←STM32 PB10
+# 协议/接线不变:
+#   坐标帧 0x3C 0x3B [XH][XL][YH][YL][FLAG][CRC] 0x01 0x01 (10字节)
+#     FLAG bit0=valid  bit1=hit  bit2=hi_conf
+#   命令帧 0x3C 0x3C [CMD][PARAM] ...
+#   接线 GPIO05(TX)->STM32 PB11, GPIO06(RX)<-STM32 PB10
 # =============================================================
 
 import uos, math, time, image, gc
+
+try:
+    import cv2
+    HAVE_CV2 = True
+    print("[CV] cv2 可用, 启用 OpenCV+RVV 加速路径")
+except ImportError:
+    HAVE_CV2 = False
+    print("[CV] cv2 不可用, 回退 find_rects/find_blobs (帧率较低, 需烧录带OpenCV的CanMV固件)")
+
 from media.sensor import *
 from media.display import *
 from media.media import *
 from machine import Pin, UART, FPIOA
 
-# ========================= 参数 =========================
-DISPLAY_W  = 800
-DISPLAY_H  = 480
+# ========================= 分辨率 =========================
+SENSOR_W = 800
+SENSOR_H = 480
+# 检测在缩小图上跑 (cv2 RVV 加速, 计算量 = (DETECT/SENSOR)^2)
+if HAVE_CV2:
+    DETECT_W, DETECT_H = 320, 240
+else:
+    DETECT_W, DETECT_H = SENSOR_W, SENSOR_H   # 回退: 直接在原图检测
+SCALE_X = SENSOR_W / DETECT_W
+SCALE_Y = SENSOR_H / DETECT_H
 
-# 激光 (RGB565 800x480) — 红色 LAB 阈值
-RED_LASER_LAB_MERGED = [(59, 71, 48, 70, 6, 25)]   # 用户实测激光 LAB: L=59~71, A=48~70, B=6~25
-RED_LASER_LAB_WIDE   = [(45, 75, 0, 75, -45, 40)]  # 兜底宽阈值
-LASER_MIN_PX        = 3
-LASER_MAX_PX        = 600
-LASER_WASHOUT_PX    = 6000      # 整屏泛红/反光拒识
-LASER_LOCK_FRAMES   = 2          # 连续 N 帧命中才锁定
-LASER_LOST_FRAMES   = 5          # 连续 N 帧丢失才释放
-LASER_POS_ALPHA     = 0.35       # 位置 EMA
-LASER_ROI_SIZE      = 81         # 锁定后局部ROI
-LASER_TRACK_MAX_D   = 60         # 最近邻跟踪最大距离
+# ========================= 激光 LAB 阈值 =========================
+# 用户实测激光 LAB: L=59~71, A=48~70, B=6~25 (检测空间下仍适用, 颜色与尺度无关)
+RED_L_MIN, RED_L_MAX = 59, 71
+RED_A_MIN, RED_A_MAX = 48, 70
+RED_B_MIN, RED_B_MAX = 6, 25
+RED_L_MIN_W, RED_L_MAX_W = 45, 75
+RED_A_MIN_W, RED_A_MAX_W = 0, 75
+RED_B_MIN_W, RED_B_MAX_W = -45, 40
+# 检测空间像素阈值 (320x240 下激光面积约 800x480 的 1/6.25)
+LASER_MIN_PX     = 2
+LASER_WASHOUT_PX = 400      # 整屏泛红/反光拒识
+LASER_LOCK_FRAMES   = 2
+LASER_LOST_FRAMES   = 5
+LASER_POS_ALPHA     = 0.35
+LASER_TRACK_MAX_D   = 40     # 检测空间最近邻跟踪最大距离
 
-# 矩形边框 (RGB565 800x480) — 靶环外黑框
-RECT_LAB           = [(15, 28, -6, 10, -9, 9)]
-RECT_MIN_AREA      = 5000
-RECT_MIN_W         = 100
-RECT_MIN_H         = 100
-RECT_RATIO_MIN     = 0.3
-RECT_RATIO_MAX     = 3.0
-RECT_SMOOTH_ALPHA  = 0.30        # 靶心时序平滑(抑制边框检测跳变)
+# ========================= 靶心检测 (cv2) =========================
+TARGET_MIN_AREA_CV = 120     # 检测空间最小轮廓面积
+TARGET_ADAPT_BLK   = 11      # 自适应阈值块大小(奇数)
+TARGET_ADAPT_C     = 5       # 自适应阈值常数
+RECT_SMOOTH_ALPHA  = 0.30
 
-# 控制
-HIT_TOLERANCE_PX  = 15           # 命中容差(像素): 误差 < 此值视为命中
-COORD_INTERVAL_MS = 25           # 坐标发送间隔(ms): 40Hz (无YOLO, 每帧都能算)
+# ========================= 控制 =========================
+HIT_TOLERANCE_PX  = 15       # 命中容差(显示空间像素)
+COORD_INTERVAL_MS = 25       # 坐标发送间隔(ms): 40Hz
 ERR_DEAD_ZONE     = 1
 
-# 颜色
-C_LASER  = (255,0,0); C_TARGET = (0,128,255)
-C_LINE   = (255,255,0); C_TEXT = (255,255,255); C_BG = (0,0,0)
-C_RECT   = (255,128,0)
+# ========================= 颜色 =========================
+C_LASER=(255,0,0); C_TARGET=(0,128,255); C_LINE=(255,255,0)
+C_TEXT=(255,255,255); C_BG=(0,0,0); C_RECT=(255,128,0)
 
 # ======================= 工具 =======================
 def draw_text_bg(img, x, y, text, fs, color=C_TEXT, bg=C_BG):
@@ -75,133 +90,117 @@ def draw_cross(img, cx, cy, sz=10, color=(128,128,128)):
     img.draw_line(cx, cy-sz, cx, cy+sz, color, 1)
     img.draw_circle(cx, cy, 2, color, 1, fill=True)
 
-def detect_laser(laser_img, prev_x, prev_y, locked):
-    """多阈值+局部ROI+最近邻跟踪的激光检测。
+def _contours_of(ret):
+    """兼容 cv2.findContours 两种返回格式 (2值/3值)。"""
+    if ret is None:
+        return []
+    if len(ret) == 2:
+        return ret[0]
+    return ret[1]
 
-    返回: (raw_x, raw_y, ok)
-    """
-    if not laser_img:
-        return -1, -1, False
-
-    blobs = None
-    roi = None
-    search_mode = "global"
-
-    # --- 锁定后先做局部 ROI 搜索 ---
-    if locked and prev_x >= 0 and prev_y >= 0:
-        hs = LASER_ROI_SIZE // 2
-        rx = max(0, prev_x - hs)
-        ry = max(0, prev_y - hs)
-        rw = min(LASER_ROI_SIZE, DISPLAY_W - rx)
-        rh = min(LASER_ROI_SIZE, DISPLAY_H - ry)
-        if rw >= 10 and rh >= 10:
-            roi = (rx, ry, rw, rh)
-            search_mode = "roi"
-            blobs = laser_img.find_blobs(RED_LASER_LAB_MERGED, False, roi=roi,
-                x_stride=1, y_stride=1, pixels_threshold=LASER_MIN_PX,
-                merge=True, margin=True)
-
-    # --- ROI 未命中 → 全局合并阈值搜索 ---
-    if not blobs:
-        search_mode = "global"
-        blobs = laser_img.find_blobs(RED_LASER_LAB_MERGED, False,
-            x_stride=2, y_stride=2, pixels_threshold=LASER_MIN_PX,
-            merge=True, margin=True)
-
-    # --- 全局仍无 → 兜底放宽阈值 ---
-    if not blobs:
-        search_mode = "wide"
-        blobs = laser_img.find_blobs(RED_LASER_LAB_WIDE, False,
-            x_stride=1, y_stride=1, pixels_threshold=LASER_MIN_PX,
-            merge=True, margin=True)
-
-    if not blobs:
-        return -1, -1, False
-
-    # 面积筛选(去整屏反光/噪声)
-    cands = []
-    for b in blobs:
-        px = b.pixels()
-        if not (LASER_MIN_PX <= px <= LASER_WASHOUT_PX):
-            continue
-        bw, bh = b.w(), b.h()
-        if bw < 1 or bh < 1:
-            continue
-        ratio = float(max(bw, bh)) / float(min(bw, bh))
-        if ratio > 2.5:
-            continue
-        fill = float(px) / float(bw * bh)
-        if fill < 0.3:
-            continue
-        cands.append((b, px, ratio, fill))
-
-    if not cands:
-        return -1, -1, False
-
-    # 锁定后优先最近邻, 未锁定或跳变过大用综合评分(面积×紧凑度)
-    if locked and prev_x >= 0 and prev_y >= 0:
-        best_data = min(cands, key=lambda t: (t[0].cx()-prev_x)**2 + (t[0].cy()-prev_y)**2)
-        d2 = (best_data[0].cx()-prev_x)**2 + (best_data[0].cy()-prev_y)**2
-        if d2 > LASER_TRACK_MAX_D * LASER_TRACK_MAX_D:
-            best_data = max(cands, key=lambda t: t[1] * t[3])
-    else:
-        best_data = max(cands, key=lambda t: t[1] * t[3])
-
-    best = best_data[0]
-    return best.cx(), best.cy(), True
-
-def detect_rect_contours(laser_img):
-    """检测矩形边框(靶环外黑框) → 返回靶心中心 (cx, cy) 或 None。
-
-    使用 find_rects() (AprilTag 四边形算法) 基于边缘对比度找矩形,
-    不依赖颜色, 不受光照/颜色漂移影响。外矩形中心即靶环中心(同心靶)。
-    """
+# ======================= cv2 检测 =======================
+def detect_target_cv2(small):
+    """small: RGB888 ndarray (DETECT_H, DETECT_W, 3) -> 靶心(detect space) 或 None。"""
     try:
-        rects = laser_img.find_rects(threshold=2500)
-        if not rects:
-            rects = laser_img.find_rects(threshold=1000)
-        if not rects:
+        gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        # 反相二值化: 暗环/暗靶面 -> 白。自适应阈值抗光照不均
+        bin_img = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                        cv2.THRESH_BINARY_INV, TARGET_ADAPT_BLK, TARGET_ADAPT_C)
+        contours = _contours_of(cv2.findContours(bin_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE))
+        if not contours:
             return None
-
-        # 筛选最佳矩形(面积×边缘置信度)
-        best, best_score = None, 0
-        ox = oy = ow = oh = 0
-        for r in rects:
-            x, y, w, h = r.rect()
-            if w < RECT_MIN_W or h < RECT_MIN_H:
-                continue
-            ratio = max(w, h) / min(w, h)
-            if ratio < RECT_RATIO_MIN or ratio > RECT_RATIO_MAX:
-                continue
-            mag = r.magnitude()
-            score = (w * h) * (mag / 5000.0)
-            if score > best_score:
-                best_score = score
-                best = r
-                ox, oy, ow, oh = x, y, w, h
-
-        if best is None:
+        best = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(best) < TARGET_MIN_AREA_CV:
             return None
-
-        # 外框中心 = 靶环中心(同心靶近似)
-        cx = ox + ow // 2
-        cy = oy + oh // 2
-        return (cx, cy, ow, oh)
+        # 优先判断方形框(4边形)中心; 否则用轮廓矩中心(同心圆靶)
+        peri = cv2.arcLength(best, True)
+        approx = cv2.approxPolyDP(best, 0.02 * peri, True)
+        if len(approx) == 4:
+            M = cv2.moments(approx)
+            if M['m00'] != 0:
+                return (M['m10'] / M['m00'], M['m01'] / M['m00'])
+        M = cv2.moments(best)
+        if M['m00'] != 0:
+            return (M['m10'] / M['m00'], M['m01'] / M['m00'])
     except Exception as e:
-        print("rect err:", e)
+        print("tgt_cv err:", e)
     return None
 
-# ==================== 串口 ====================
+def detect_laser_cv2(small, prev, locked):
+    """small: RGB888 ndarray -> (cx, cy, ok) detect space。"""
+    try:
+        lab = cv2.cvtColor(small, cv2.COLOR_RGB2LAB)
+        mask = cv2.inRange(lab,
+            (RED_L_MIN, RED_A_MIN, RED_B_MIN),
+            (RED_L_MAX, RED_A_MAX, RED_B_MAX))
+        contours = _contours_of(cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE))
+        if not contours:
+            # 兜底宽阈值
+            mask = cv2.inRange(lab,
+                (RED_L_MIN_W, RED_A_MIN_W, RED_B_MIN_W),
+                (RED_L_MAX_W, RED_A_MAX_W, RED_B_MAX_W))
+            contours = _contours_of(cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE))
+        if not contours:
+            return -1, -1, False
+        cands = []
+        for c in contours:
+            a = cv2.contourArea(c)
+            if a < LASER_MIN_PX or a > LASER_WASHOUT_PX:
+                continue
+            M = cv2.moments(c)
+            if M['m00'] == 0:
+                continue
+            cands.append((M['m10'] / M['m00'], M['m01'] / M['m00'], a))
+        if not cands:
+            return -1, -1, False
+        if locked and prev[0] >= 0:
+            best = min(cands, key=lambda t: (t[0]-prev[0])**2 + (t[1]-prev[1])**2)
+        else:
+            best = max(cands, key=lambda t: t[2])
+        return best[0], best[1], True
+    except Exception as e:
+        print("las_cv err:", e)
+    return -1, -1, False
+
+# ======================= 回退检测 (无 cv2) =======================
+def detect_target_legacy(img):
+    try:
+        rects = img.find_rects(threshold=2500)
+        if not rects:
+            rects = img.find_rects(threshold=1000)
+        if not rects:
+            return None
+        best, score = None, 0
+        for r in rects:
+            x, y, w, h = r.rect()
+            if w < 100 or h < 100:
+                continue
+            s = (w * h) * (r.magnitude() / 5000.0)
+            if s > score:
+                score = s; best = r
+        if best is None:
+            return None
+        x, y, w, h = best.rect()
+        return (x + w // 2, y + h // 2)
+    except Exception:
+        return None
+
+def detect_laser_legacy(img, prev_x, prev_y, locked):
+    blobs = img.find_blobs([(RED_L_MIN, RED_L_MAX, RED_A_MIN, RED_A_MAX, RED_B_MIN, RED_B_MAX)],
+                           False, x_stride=2, y_stride=2, pixels_threshold=LASER_MIN_PX*6, merge=True, margin=True)
+    if not blobs:
+        return -1, -1, False
+    b = max(blobs, key=lambda b: b.pixels())
+    return b.cx(), b.cy(), True
+
+# ======================== 串口 ========================
 def crc8(data):
-    """CRC8 (poly 0x07, init 0x00) — 与 STM32 端逐字节一致。"""
     crc = 0
     for byte in data:
         crc ^= byte
         for _ in range(8):
-            if crc & 0x80:
-                crc = ((crc << 1) ^ 0x07) & 0xFF
-            else:
-                crc = (crc << 1) & 0xFF
+            crc = ((crc << 1) ^ 0x07) & 0xFF if (crc & 0x80) else (crc << 1) & 0xFF
     return crc & 0xFF
 
 def send_coord(uart, x, y, valid, hit, hi_conf):
@@ -235,31 +234,30 @@ def recv_status(uart):
     if not uart:
         return None
     try:
-        if uart.any()<8:
+        if uart.any() < 8:
             return None
-        b=uart.read(8)
-        if not b or len(b)!=8:
+        b = uart.read(8)
+        if not b or len(b) != 8:
             return None
-        if b[0]!=0x3C or b[1]!=0x3D:
+        if b[0] != 0x3C or b[1] != 0x3D:
             return None
-        if (sum(b[0:7])&0xFF)!=b[7]:
+        if (sum(b[0:7]) & 0xFF) != b[7]:
             return None
         return (b[2]*270/255, b[3]*180/255, min(b[4],5),
                 bool(b[5]&1), bool(b[5]&2), b[6])
     except:
         return None
 
-# ==================== 主函数 ====================
+# ======================== 主函数 ========================
 def run():
-    # ---- 摄像头 (庐山派单通道 RGB565, 简洁可靠) ----
-    sensor = Sensor(width=DISPLAY_W, height=DISPLAY_H)
+    sensor = Sensor(width=SENSOR_W, height=SENSOR_H)
     sensor.reset()
-    sensor.set_framesize(width=DISPLAY_W, height=DISPLAY_H)
-    sensor.set_pixformat(Sensor.RGB565)
-    Display.init(Display.ST7701, width=DISPLAY_W, height=DISPLAY_H, to_ide=True)
+    sensor.set_framesize(width=SENSOR_W, height=SENSOR_H)
+    sensor.set_pixformat(Sensor.RGB888 if HAVE_CV2 else Sensor.RGB565)
+    Display.init(Display.ST7701, width=SENSOR_W, height=SENSOR_H, to_ide=True)
     MediaManager.init()
     sensor.run()
-    print("[CAM] OK")
+    print("[CAM] OK %dx%d %s" % (SENSOR_W, SENSOR_H, "RGB888+cv2" if HAVE_CV2 else "RGB565+legacy"))
 
     uart = None
     try:
@@ -276,25 +274,21 @@ def run():
     try:
         if uart:
             send_cmd(uart, 0x01, 1)
-        else:
-            print("[WARN] no uart")
-
         last_send = last_mode = 0
         fps = 0.0
         last_ms = time.ticks_ms()
         prev_hit = False
 
-        # 激光时序状态
-        lx_s = ly_s = 0
+        # 激光时序 (detect space)
+        lx_s = ly_s = 0.0
         l_lock = False
         l_hit_cnt = 0
         l_miss_cnt = 0
         last_lx = last_ly = 0
         last_laser_ms = 0
 
-        # 靶心时序状态
-        rect_smooth = None
-        tgt_x = tgt_y = 0
+        # 靶心时序 (detect space)
+        tgt_x = tgt_y = 0.0
         tgt_init = False
         last_tgt_ms = 0
         tgt_xh = tgt_yh = 0
@@ -303,7 +297,7 @@ def run():
         srv_st = srv_ok = 0
         fc = 0
 
-        print("=== 非YOLO 版: find_rects(靶环) + find_blobs(激光) ===")
+        print("=== 高帧率版: cv2轮廓检测(靶心)+cv2 LAB(激光) ===")
 
         while True:
             if key.value():
@@ -311,41 +305,45 @@ def run():
                     send_cmd(uart, 0x02, 0)
                 time.sleep_ms(500)
 
-            # --- 取帧 (单通道 RGB565) ---
             try:
                 img = sensor.snapshot()
             except Exception as e:
                 time.sleep_ms(30)
                 continue
 
-            # ============== 激光检测 (每帧) ==============
-            raw_det = False
-            rlx = rly = -1
-            rlx, rly, raw_det = detect_laser(img, lx_s if l_lock else -1,
-                                             ly_s if l_lock else -1, l_lock)
+            # ============== 检测 (cv2 小图 / 回退原图) ==============
+            if HAVE_CV2:
+                arr = img.to_numpy_ref()              # 零拷贝 RGB888 ndarray
+                small = cv2.resize(arr, (DETECT_W, DETECT_H))   # RVV 加速
+                t_raw = detect_target_cv2(small)
+                lx_d, ly_d, l_raw = detect_laser_cv2(small,
+                    (lx_s, ly_s) if l_lock else (-1, -1), l_lock)
+            else:
+                t_raw = detect_target_legacy(img)
+                lx_d, ly_d, l_raw = detect_laser_legacy(img,
+                    lx_s if l_lock else -1, ly_s if l_lock else -1, l_lock)
 
-            if raw_det:
+            # ============== 激光时序 (detect space) ==============
+            if l_raw:
                 l_hit_cnt = min(l_hit_cnt + 1, 32)
                 l_miss_cnt = 0
                 if not l_lock and l_hit_cnt == 1:
-                    lx_s, ly_s = rlx, rly
+                    lx_s, ly_s = lx_d, ly_d
                 else:
-                    max_jump = 50
-                    dx = rlx - lx_s
-                    dy = rly - ly_s
+                    max_jump = 40
+                    dx = lx_d - lx_s
+                    dy = ly_d - ly_s
                     d2 = dx*dx + dy*dy
-                    if d2 > max_jump * max_jump:
+                    if d2 > max_jump * max_jump and d2 > 0:
                         scale = max_jump / math.sqrt(d2)
-                        rlx = int(lx_s + dx * scale)
-                        rly = int(ly_s + dy * scale)
-                    lx_s = int(lx_s*(1-LASER_POS_ALPHA) + rlx*LASER_POS_ALPHA)
-                    ly_s = int(ly_s*(1-LASER_POS_ALPHA) + rly*LASER_POS_ALPHA)
-                if l_hit_cnt >= LASER_LOCK_FRAMES:
-                    if not l_lock:
-                        l_lock = True
-                    last_lx = lx_s
-                    last_ly = ly_s
-                    last_laser_ms = time.ticks_ms()
+                        lx_d = lx_s + dx * scale
+                        ly_d = ly_s + dy * scale
+                    lx_s = lx_s*(1-LASER_POS_ALPHA) + lx_d*LASER_POS_ALPHA
+                    ly_s = ly_s*(1-LASER_POS_ALPHA) + ly_d*LASER_POS_ALPHA
+                if l_hit_cnt >= LASER_LOCK_FRAMES and not l_lock:
+                    l_lock = True
+                last_lx = lx_s; last_ly = ly_s
+                last_laser_ms = time.ticks_ms()
             else:
                 l_miss_cnt = min(l_miss_cnt + 1, 32)
                 l_hit_cnt = 0
@@ -357,78 +355,47 @@ def run():
             ly = ly_s if l_det else -1
 
             if fc % 30 == 0:
-                print("[LASER] det=%d lock=%d hit=%d miss=%d pos=(%d,%d)" % (
-                    raw_det, l_lock, l_hit_cnt, l_miss_cnt,
-                    lx if l_det else -1, ly if l_det else -1))
+                print("[LASER] det=%d lock=%d pos=(%.0f,%.0f)" % (l_raw, l_lock, lx, ly))
 
-            # ============== 靶心检测 (非YOLO: find_rects, 每帧) ==============
-            r_raw = detect_rect_contours(img)
-            if r_raw:
-                cx, cy, ow, oh = r_raw
-                if rect_smooth is None:
-                    rect_smooth = (cx, cy, ow, oh)
-                else:
-                    a = RECT_SMOOTH_ALPHA
-                    scx = int(rect_smooth[0]*(1-a) + cx*a)
-                    scy = int(rect_smooth[1]*(1-a) + cy*a)
-                    sow = int(rect_smooth[2]*(1-a) + ow*a)
-                    soh = int(rect_smooth[3]*(1-a) + oh*a)
-                    rect_smooth = (scx, scy, sow, soh)
-                target_x = rect_smooth[0]
-                target_y = rect_smooth[1]
-                target_valid = True
-            else:
-                rect_smooth = None
-                target_valid = False
-
-            # 靶心 EMA 平滑(轻量, 防边框检测抖)
-            if target_valid:
+            # ============== 靶心时序 (detect space) ==============
+            if t_raw:
+                tx, ty = t_raw
                 if not tgt_init:
-                    tgt_x = target_x
-                    tgt_y = target_y
-                    tgt_init = True
+                    tgt_x, tgt_y, tgt_init = tx, ty, True
                 else:
-                    dx = target_x - tgt_x
-                    dy = target_y - tgt_y
-                    a = 0.4   # 较激进(低延迟), 比 YOLO 版更快收敛
-                    tgt_x = int(tgt_x*(1-a) + target_x*a)
-                    tgt_y = int(tgt_y*(1-a) + target_y*a)
-
-            # ============== 误差合成 ==============
-            now = time.ticks_ms()
-            # 靶心保持(短暂丢失沿用上次)
-            TARGET_HOLD_MS = 400
-            if target_valid:
-                last_tgt_ms = now
+                    a = 0.4
+                    tgt_x = tgt_x*(1-a) + tx*a
+                    tgt_y = tgt_y*(1-a) + ty*a
+                last_tgt_ms = time.ticks_ms()
                 tgt_xh, tgt_yh = tgt_x, tgt_y
-            elif last_tgt_ms and time.ticks_diff(now, last_tgt_ms) < TARGET_HOLD_MS:
-                target_valid = True
-                tgt_x, tgt_y = tgt_xh, tgt_yh
+            elif tgt_init and time.ticks_diff(time.ticks_ms(), last_tgt_ms) < 400:
+                tgt_x, tgt_y = tgt_xh, tgt_yh   # 短暂保持
+            else:
+                tgt_init = False
 
-            # 激光保持
-            LASER_HOLD_MS = 500
+            target_valid = tgt_init
+
+            # ============== 误差合成 (放大到显示空间) ==============
+            now = time.ticks_ms()
             l_det_hold = l_det or (last_laser_ms and
-                         time.ticks_diff(now, last_laser_ms) < LASER_HOLD_MS)
+                         time.ticks_diff(now, last_laser_ms) < 500)
             if l_det_hold:
                 vlx = lx if l_det else last_lx
                 vly = ly if l_det else last_ly
 
-            # 只有激光+靶心都到位才发误差
             if l_det_hold and target_valid:
-                ex = tgt_x - vlx
-                ey = tgt_y - vly
+                # 显示空间误差
+                ex = int((tgt_x - vlx) * SCALE_X)
+                ey = int((tgt_y - vly) * SCALE_Y)
                 valid_out = True
             elif l_det_hold and not target_valid:
-                ex = 0
-                ey = 0
-                valid_out = True      # 激光在但无靶心 → 保持位置
+                ex = ey = 0
+                valid_out = True
             else:
-                ex = 0
-                ey = 0
-                valid_out = False      # 无激光 → 不发误差, STM32 冻结
+                ex = ey = 0
+                valid_out = False
 
             hit = l_det and target_valid and abs(ex) < HIT_TOLERANCE_PX and abs(ey) < HIT_TOLERANCE_PX
-            # 高置信度: 靶心与激光都可靠识别
             hi_conf = bool(target_valid and l_det)
             prev_hit = hit
 
@@ -436,57 +403,51 @@ def run():
             sy_err = ey if abs(ey) > ERR_DEAD_ZONE else 0
 
             if time.ticks_diff(now, last_send) >= COORD_INTERVAL_MS:
-                send_coord(uart, sx_err, sy_err,
-                           valid=valid_out, hit=hit, hi_conf=hi_conf)
+                send_coord(uart, sx_err, sy_err, valid=valid_out, hit=hit, hi_conf=hi_conf)
                 last_send = now
 
-            # 每2s重发AIM
             if time.ticks_diff(now, last_mode) > 2000:
                 if uart:
                     send_cmd(uart, 0x01, 1)
                 last_mode = now
 
-            # STM32 回传
             sv = recv_status(uart)
             if sv:
                 srv_y, srv_p, srv_st, srv_ok = sv[0], sv[1], sv[2], True
 
-            # ============== OSD ==============
-            draw_cross(img, DISPLAY_W//2, DISPLAY_H//2)
-
+            # ============== OSD (显示空间坐标) ==============
+            draw_cross(img, SENSOR_W//2, SENSOR_H//2)
             if l_det:
+                ldx = int(lx * SCALE_X); ldy = int(ly * SCALE_Y)
                 sz = 14
-                img.draw_line(lx-sz, ly, lx+sz, ly, C_LASER, 2)
-                img.draw_line(lx, ly-sz, lx, ly+sz, C_LASER, 2)
-                img.draw_string_advanced(lx+sz+2, ly-8, 14, "R", color=C_LASER)
-                if not raw_det:
-                    img.draw_circle(lx, ly, 6, C_LASER, 1)
-
+                img.draw_line(ldx-sz, ldy, ldx+sz, ldy, C_LASER, 2)
+                img.draw_line(ldx, ldy-sz, ldx, ldy+sz, C_LASER, 2)
+                img.draw_string_advanced(ldx+sz+2, ldy-8, 14, "R", color=C_LASER)
             if target_valid:
+                tdx = int(tgt_x * SCALE_X); tdy = int(tgt_y * SCALE_Y)
                 sz = 16
-                img.draw_rectangle(tgt_x-sz, tgt_y-sz, sz*2, sz*2, C_RECT, 2)
-                img.draw_circle(tgt_x, tgt_y, 3, (255,0,0), 2, fill=True)
-
+                img.draw_rectangle(tdx-sz, tdy-sz, sz*2, sz*2, C_RECT, 2)
+                img.draw_circle(tdx, tdy, 3, (255,0,0), 2, fill=True)
             if l_det and target_valid:
-                dx = lx - tgt_x
-                dy = ly - tgt_y
+                ldx = int(lx * SCALE_X); ldy = int(ly * SCALE_Y)
+                tdx = int(tgt_x * SCALE_X); tdy = int(tgt_y * SCALE_Y)
+                dx = ldx - tdx; dy = ldy - tdy
                 dp = int(math.sqrt(dx*dx + dy*dy))
-                mx = (lx + tgt_x)//2
-                my = (ly + tgt_y)//2
-                img.draw_line(lx, ly, tgt_x, tgt_y, C_LINE, 1)
+                mx = (ldx + tdx)//2; my = (ldy + tdy)//2
+                img.draw_line(ldx, ldy, tdx, tdy, C_LINE, 1)
                 img.draw_string_advanced(mx+4, my-10, 14, "%dpx" % dp, color=C_LINE)
 
             lh = 22
-            gl = "R:(%3d,%3d)" % (lx, ly) if l_det else "R: --"
+            gl = "R:(%3d,%3d)" % (int(lx*SCALE_X), int(ly*SCALE_Y)) if l_det else "R: --"
             draw_text_bg(img, 4, 4, gl, 18, color=C_LASER)
-            tt = "T:(%3d,%3d)" % (tgt_x, tgt_y) if target_valid else "T: --"
+            tt = "T:(%3d,%3d)" % (int(tgt_x*SCALE_X), int(tgt_y*SCALE_Y)) if target_valid else "T: --"
             draw_text_bg(img, 4, 4+lh, tt, 18, color=C_TARGET)
             if l_det and target_valid:
                 st = "err:(%3d,%3d) %s" % (sx_err, sy_err, "HIT" if hit else "")
                 draw_text_bg(img, 4, 4+lh*2, st, 18, color=C_LINE)
             if srv_ok:
                 sn = STATES[min(int(srv_st), 5)]
-                draw_text_bg(img, 4, DISPLAY_H-24,
+                draw_text_bg(img, 4, SENSOR_H-24,
                     "Srv:Y%3d,P%3d[%s]" % (int(srv_y), int(srv_p), sn), 16, color=C_TEXT)
 
             n = time.ticks_ms()
@@ -494,10 +455,11 @@ def run():
             last_ms = n
             if dt > 0:
                 fps = fps*0.8 + 1000/dt*0.2 if fps > 0 else 1000/dt
-            draw_text_bg(img, DISPLAY_W-90, 4, "FPS:%.1f" % fps, 18)
+            draw_text_bg(img, SENSOR_W-90, 4, "FPS:%.1f" % fps, 18)
 
             Display.show_image(img)
-
+            if fc % 10 == 0:
+                gc.collect()
             fc += 1
 
     except Exception as e:
