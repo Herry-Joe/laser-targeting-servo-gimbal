@@ -102,6 +102,7 @@ static volatile uint8_t s_bt_cmd_ready = 0;
 /* ========================== 命令反馈 (LED 视觉反馈) ========================== */
 static uint32_t g_feedback_until = 0;   /* LED 保持亮到此时间戳 */
 static uint8_t  g_locked_feedback = 0;  /* 命中锁定提示只打印一次 */
+static uint8_t  g_hit_locked      = 0;  /* 命中后双轴锁存(停稳); 误差明显偏离或丢帧才解锁 */
 
 /* ========================== K230 上位机坐标帧接收 ========================== */
 /** @brief 坐标帧解析状态 */
@@ -322,6 +323,7 @@ static void K230_PID_Init(K230_PID *pid,
 #define PID_DEADZONE    3       /* 死区 (像素) — Pan 轴 */
 #define PID_DEADZONE_TILT 4     /* Tilt 轴死区 */
 #define K230_HYST_PX    4       /* 滞回迟滞(px): 锁靶后误差需超 死区+此值 才重新驱动, 消除边界微抖 */
+#define HIT_RELEASE_PX  40      /* 命中锁存后, 误差超此值(px)才重新捕获(远大于命中容差15px, 根治靶心附近抖停不停) */
 
 /* ---- Tilt 垂直轴专用限制 (防"激光打到天上") ---- */
 /*   STEPPER_HALF_REV=4096 步 = 360°, 故 1 步 ≈ 0.088° */
@@ -1215,6 +1217,19 @@ static void Serial_Execute(void)
             CmdReply("# OK Tilt 方向反转: %s\n",
                    g_tilt_dir_invert ? "ON (已反转)" : "OFF (正常)");
             return;
+        case 'u': case 'U':   /* 解除命中锁存, 重新捕获下一靶 */
+            if (g_hit_locked) {
+                g_hit_locked = 0;
+                g_locked_feedback = 0;
+                K230_PID_Reset(&g_pid_pan);
+                K230_PID_Reset(&g_pid_tilt);
+                g_pid_pan.locked  = 0;
+                g_pid_tilt.locked = 0;
+                CmdReply("# OK 解除命中锁存, 重新捕获\r\n");
+            } else {
+                CmdReply("# 当前未命中锁存\r\n");
+            }
+            return;
         case '?':
             PrintHelp();
             PrintStatus();
@@ -1680,6 +1695,7 @@ static void K230_Freeze(const char *reason)
     g_tilt_out_filter = 0.0f;
     g_kf_x.init = 0; g_kf_y.init = 0;
     g_conf_streak = 0;
+    g_hit_locked  = 0;   /* 检测丢失时解除命中锁存, 允许重新捕获 */
     static uint32_t last_print = 0;
     uint32_t now = HAL_GetTick();
     if (now - last_print > 1000) {
@@ -1752,6 +1768,31 @@ static void K230_ProcessFrame(void)
         printf("\r\n[K230] → 自动打靶 双轴控制\n");
     }
 
+    /* ---- 命中锁存: 一旦 hit&&conf 即双轴锁死停稳, 不再受小误差扰动 ----
+     * 根治"打到靶上停不下来": 原锁存解锁阈值仅 死区+4px=7px, 而命中容差15px,
+     * 导致 7~15px 区间内反复解锁→重追→再锁。现改为粘滞锁存:
+     *   - 命中即锁, 电机停、PID 重置
+     *   - 仅当误差明显偏离(>HIT_RELEASE_PX=40px, 目标真的移动)或丢帧才释放
+     *   - 可发 'u' 命令手动解锁, 便于连续打多个靶 */
+    if (g_hit_locked) {
+        /* 已锁存: 默认保持停稳; 检查释放条件 */
+        int reacq = (abs(err_x) > HIT_RELEASE_PX) || (abs(err_y) > HIT_RELEASE_PX);
+        if (reacq) {
+            g_hit_locked = 0;
+            g_locked_feedback = 0;
+            K230_PID_Reset(&g_pid_pan);
+            K230_PID_Reset(&g_pid_tilt);
+            g_pid_pan.locked  = 0;
+            g_pid_tilt.locked = 0;
+            printf("\r\n[K230] 误差偏离>%dpx, 解除命中锁存重新捕获\r\n", HIT_RELEASE_PX);
+        } else {
+            /* 保持锁定: 确保电机停稳 */
+            if (Stepper_GetState(&g_motor_pan)  != STATE_IDLE) Stepper_Stop(&g_motor_pan);
+            if (Stepper_GetState(&g_motor_tilt) != STATE_IDLE) Stepper_Stop(&g_motor_tilt);
+            return;
+        }
+    }
+
     /* ---- Pan 轴 (X 误差) 软限位 ±40°, 置信度决定死区 ---- */
     K230_ControlAxis(&g_motor_pan, &g_pid_pan, err_x, &g_kf_x,
                      g_pan_dir_invert, "Pan", &g_pan_out_filter,
@@ -1762,13 +1803,13 @@ static void K230_ProcessFrame(void)
                      g_tilt_dir_invert, "Tilt", &g_tilt_out_filter,
                      tilt_dz, TILT_MAX_STEPS, TILT_SPEED_SCALE);
 
-    /* 命中保持: K230 确认靶心锁定(hit=1) → 双轴锁靶不抖, 激光稳稳压在目标上 */
+    /* 命中锁存触发: K230 确认靶心锁定(hit=1) 且高置信度 → 进入锁存 */
     if (hit && conf) {
         g_feedback_until = HAL_GetTick() + 200;
         LED_ON();
         if (!g_locked_feedback) {
             g_locked_feedback = 1;
-            printf("\r\n[K230] 命中锁定, 双轴保持\r\n");
+            printf("\r\n[K230] 命中锁定 → 双轴保持 (发 u 解锁/再捕获)\r\n");
         }
         Stepper_Stop(&g_motor_pan);
         Stepper_Stop(&g_motor_tilt);
@@ -1776,8 +1817,9 @@ static void K230_ProcessFrame(void)
         K230_PID_Reset(&g_pid_tilt);
         g_pid_pan.locked  = 1;   /* 锁靶, 后续靠滞回迟滞防抖 */
         g_pid_tilt.locked = 1;
+        g_hit_locked = 1;        /* 粘滞锁存 */
     } else {
-        g_locked_feedback = 0;   /* 目标移动, 解除提示, 下一帧恢复追踪 */
+        g_locked_feedback = 0;   /* 未命中, 正常追踪 */
     }
 }
 
