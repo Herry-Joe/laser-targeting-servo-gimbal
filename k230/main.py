@@ -43,8 +43,8 @@ OUT_H      = 1080
 #   原 RED_LASER_LAB + RED_LASER_LAB_USER 两组阈值会互相竞争: 帧 N 用阈值1找到位置A,
 #   帧 N+1 用阈值2找到位置B, 最近邻跟踪也挡不住。合并后一次 find_blobs 返回所有候选,
 #   由质量过滤统一决策, 一致性大幅提升。
-RED_LASER_LAB_MERGED = [(45, 79, 16, 68, -36, 28)] # 合并: L=45~79, A=16~68, B=-36~28
-RED_LASER_LAB_WIDE   = [(45, 75, 0, 75, -45, 40)]  # 兜底阈值: 放宽 L/A/B
+RED_LASER_LAB_MERGED = [(59, 71, 48, 70, 6, 25)] # v4.17 用户实测激光 LAB 阈值: L=59~71, A=48~70, B=6~25
+RED_LASER_LAB_WIDE   = [(45, 75, 0, 75, -45, 40)]  # 兜底阈值: 放宽 L/A/B (仍覆盖上述范围)
 LASER_MIN_PX        = 3
 LASER_MAX_PX        = 600        # 放宽上限
 LASER_WASHOUT_PX    = 6000       # 整屏泛红/反光拒识

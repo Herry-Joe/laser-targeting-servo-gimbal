@@ -1,8 +1,9 @@
 /**
  * @file    stepper.h
- * @brief   28BYJ-48 步进电机驱动模块 (TB6612 版本) — 支持多实例
- * @note    提供全步进、半步进两种模式的速度/方向/角度控制接口
- *          支持多电机实例，用于云台双轴控制
+ * @brief   舵机 (Servo) 二维云台驱动模块 — 支持多实例
+ * @note    复用"虚拟步进"模型 (pos_steps, 单位 0.1°) 以兼容原位置闭环算法,
+ *          底层由 TIM3 PWM 输出驱动标准舵机 (270°).
+ *          支持多电机实例，用于云台双轴 (Pan/Tilt) 控制.
  */
 
 #ifndef __STEPPER_H
@@ -51,33 +52,36 @@ typedef enum {
 
 /* ========================== 结构体定义 ========================== */
 
-/** @brief 步进电机引脚配置 */
+/** @brief 舵机控制结构体
+ *  @note  保留"虚拟步进"模型以兼容原位置闭环 PID, 仅把物理驱动从
+ *         GPIO 步进序列改为 TIM3 PWM 输出。pos_steps 单位 = 0.1°。
+ */
 typedef struct {
-    GPIO_TypeDef *ain1_port; uint16_t ain1_pin;
-    GPIO_TypeDef *ain2_port; uint16_t ain2_pin;
-    GPIO_TypeDef *bin1_port; uint16_t bin1_pin;
-    GPIO_TypeDef *bin2_port; uint16_t bin2_pin;
-} StepperPins;
-
-/** @brief 步进电机控制结构体 */
-typedef struct {
-    StepMode    mode;               /* 当前步进模式 */
+    StepMode    mode;               /* 占位 (舵机无步进模式概念) */
     Direction   dir;                /* 当前方向 */
     Direction   saved_dir;          /* 方向备份 (旋转后恢复用) */
     uint8_t     restore_dir_flag;   /* 旋转完成后恢复方向 */
     MotorState  state;              /* 运行状态 */
     WorkMode    work_mode;          /* 工作模式 */
-    uint8_t     step_index;         /* 当前步序索引 (0~7) */
-    uint32_t    step_delay_us;      /* 步间延时 (微秒)，越小越快 */
+    uint8_t     step_index;         /* 节拍计数 (0~7, 仅用于遥测/心跳) */
+    uint32_t    step_delay_us;      /* 步进节拍周期 (us) = 舵机指令刷新率 */
     int32_t     target_steps;       /* 目标步数（剩余） */
     uint32_t    angle_limit_steps;  /* 扫描角度限制步数 */
-    StepperPins pins;               /* 引脚映射 */
-    TIM_HandleTypeDef *htim;        /* 关联的定时器句柄 */
+    TIM_HandleTypeDef *htim;        /* 步进节拍定时器 (TIM2=Pan / TIM4=Tilt) */
+    TIM_HandleTypeDef *htim_pwm;    /* 舵机 PWM 定时器 (TIM1) */
+    uint32_t    pwm_channel;        /* 舵机 PWM 通道 */
     char        label[8];           /* 标签: "Pan"/"Tilt" */
+    /* ---- 每轴独立脉宽映射 (支持不同行程的舵机混搭) ---- */
+    int32_t     pulse_min_us;       /* 该轴 0° 对应脉宽 (us) */
+    int32_t     pulse_max_us;       /* 该轴最大角度对应脉宽 (us) */
+    int32_t     center_us;          /* 该轴中位脉宽 (us), 对应 pos_steps=0 */
+    float       us_per_deg;         /* 该轴 us/° 系数 */
+    int32_t     pos_limit_min_hard; /* 硬限位下限 (步, 0.1°) */
+    int32_t     pos_limit_max_hard; /* 硬限位上限 (步, 0.1°) */
     /* ---- 软件加速 ---- */
     uint8_t     soft_start;         /* >0 = 软启动剩余步数 */
     uint32_t    soft_start_delay;   /* 软启动起始延迟 (比目标慢) */
-    int32_t     pos_steps;          /* 绝对位置 (相对上电零点, CW 为正) — 用于限位 */
+    int32_t     pos_steps;          /* 绝对位置 (相对上电零点, CW 为正) — 单位 0.1° */
     int32_t     target_pos;         /* 位置闭环目标位置 (步) */
     int32_t     pos_limit_min;      /* 位置下限 (步, 0 表示不限制) */
     int32_t     pos_limit_max;      /* 位置上限 (步, 0 表示不限制) */
@@ -85,9 +89,18 @@ typedef struct {
 
 /* ========================== 公共接口 ========================== */
 
-/* 初始化 */
-void Stepper_Init(StepperMotor *motor, const StepperPins *pins,
-                  TIM_HandleTypeDef *htim, const char *label);
+/* 初始化
+ *  @param htim_step    步进节拍定时器 (Pan=TIM2 / Tilt=TIM4)
+ *  @param htim_pwm     舵机 PWM 定时器 (TIM1, 50Hz)
+ *  @param pwm_channel  舵机 PWM 通道
+ *  @param pmin/pmax/center/us_deg  该轴脉宽映射参数
+ */
+void Stepper_Init(StepperMotor *motor, TIM_HandleTypeDef *htim_step,
+                  TIM_HandleTypeDef *htim_pwm, uint32_t pwm_channel,
+                  int32_t pmin_us, int32_t pmax_us, int32_t center_us,
+                  float us_per_deg,
+                  int32_t pos_min_hard, int32_t pos_max_hard,
+                  const char *label);
 
 /* 模式设置 */
 void Stepper_SetMode(StepperMotor *motor, StepMode mode);

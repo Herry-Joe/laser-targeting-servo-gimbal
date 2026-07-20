@@ -36,12 +36,19 @@
 #include <string.h>      /* strcmp() 实时调参命令 g 需要 */
 #include <stdio.h>       /* sscanf() 实时调参命令 g 需要 */
 
+/* ========================== 看门狗 ========================== */
+/* 如果选项字节开启了 IWDG 硬件模式, 上电后 IWDG 即开始计数, 须定时喂狗否则复位.
+ * 使用寄存器直写 (不依赖 HAL), 无论 IWDG 是否使能均可安全调用. */
+#define IWDG_FEED()  do { IWDG->KR = 0xAAAA; } while(0)
+
 /* STM32 28BYJ-48 + ULN2003 驱动板已上电, 任何时候 4 个输入脚决定哪根线圈通电
  * (ULN2003 IN1=橙/IN2=粉/IN3=黄/IN4=蓝). 无 STBY 概念, 不用 gate 电流. */
 
 /* ========================== 全局外设句柄 ========================== */
-TIM_HandleTypeDef  htim2;       /* 步进定时器 (Pan) */
-TIM_HandleTypeDef  htim3;       /* 步进定时器 (Tilt) */
+TIM_HandleTypeDef  htim2;       /* Pan 步进节拍定时器 */
+TIM_HandleTypeDef  htim1;       /* Tilt 舵机 PWM 定时器 (TIM1, PA11) */
+TIM_HandleTypeDef  htim3;       /* Pan 舵机 PWM 定时器 (TIM3, PB1) */
+TIM_HandleTypeDef  htim4;       /* Tilt 步进节拍定时器 */
 UART_HandleTypeDef huart1;      /* 调试串口 */
 UART_HandleTypeDef huart2;      /* 蓝牙串口 (JDY-31) */
 UART_HandleTypeDef huart3;      /* K230 上位机串口 (PB10/PB11) */
@@ -51,20 +58,11 @@ I2C_HandleTypeDef  hi2c1;       /* OLED I2C 总线 (PB8/PB9) */
 static StepperMotor g_motor_pan;    /* 水平电机 (Pan) */
 static StepperMotor g_motor_tilt;   /* 垂直电机 (Tilt) */
 
-/* ========================== 引脚配置表 ========================== */
-static const StepperPins g_pan_pins = {
-    .ain1_port = GPIOA, .ain1_pin = GPIO_PIN_4,
-    .ain2_port = GPIOA, .ain2_pin = GPIO_PIN_5,
-    .bin1_port = GPIOA, .bin1_pin = GPIO_PIN_6,
-    .bin2_port = GPIOA, .bin2_pin = GPIO_PIN_7,
-};
-
-static const StepperPins g_tilt_pins = {
-    .ain1_port = GPIOB, .ain1_pin = GPIO_PIN_3,
-    .ain2_port = GPIOB, .ain2_pin = GPIO_PIN_4,
-    .bin1_port = GPIOB, .bin1_pin = GPIO_PIN_5,
-    .bin2_port = GPIOB, .bin2_pin = GPIO_PIN_6,
-};
+/* ========================== 引脚配置表 (舵机方案) ========================== */
+/* 舵机 PWM 分两路独立定时器:
+ *   Pan 舵机 : PB1 = TIM3_CH4 (50Hz)
+ *   Tilt舵机 : PA11 = TIM1_CH4 (50Hz)
+ * 引脚分别在 TIM3_Init() / TIM1_Init() 中配置为复用推挽。 */
 
 /* ========================== 云台控制状态 ========================== */
 
@@ -103,6 +101,7 @@ static volatile uint8_t s_bt_cmd_ready = 0;
 
 /* ========================== 命令反馈 (LED 视觉反馈) ========================== */
 static uint32_t g_feedback_until = 0;   /* LED 保持亮到此时间戳 */
+static uint8_t  g_locked_feedback = 0;  /* 命中锁定提示只打印一次 */
 
 /* ========================== K230 上位机坐标帧接收 ========================== */
 /** @brief 坐标帧解析状态 */
@@ -232,6 +231,7 @@ typedef struct {
     float prev_measurement;   /* 上次测量值 (微分先行用) */
     uint32_t last_tick;       /* 上次更新 tick */
     uint8_t  initialized;
+    uint8_t  locked;          /* 滞回锁存: 进死区后置1, 误差超 死区+迟滞 才清除(防抖) */
 
     /* ---- 死区 ---- */
     float deadzone;           /* 死区宽度 (像素), 此范围内输出为 0 且不积分 */
@@ -282,6 +282,7 @@ static void K230_PID_Reset(K230_PID *pid)
     pid->deriv_filtered = 0.0f;
     pid->last_tick      = HAL_GetTick();
     pid->initialized    = 1;
+    pid->locked         = 0;
 }
 
 /**
@@ -312,20 +313,21 @@ static void K230_PID_Init(K230_PID *pid,
  *
  *   v5.2 调整: Kp 从 1.0 降至 0.005, 让速度在 0~200px 范围内比例变化,
  *   而非"非全速即停", 配合更宽的减速区实现平滑逼近, 根治过冲振荡. */
-#define PAN_GAIN        0.005f  /* Pan 速度增益: 200px→全速, 100px→50% */
-#define PAN_DEC_ZONE    60.0f   /* Pan 减速区(px): 误差<60px 时速度线性降为0 */
-#define TILT_GAIN       0.004f  /* Tilt 速度增益: 略慢于 Pan */
-#define TILT_DEC_ZONE   50.0f   /* Tilt 减速区(px): 更宽 -> 垂直轴更柔 */
-#define CTRL_KD         0.0005f /* 接近阻尼: 轻微抑制过冲 (原 0.0) */
+#define PAN_GAIN        0.006f  /* Pan 速度增益: 降增益抑过冲(约167px→全速), 仍跟手 */
+#define PAN_DEC_ZONE    120.0f  /* Pan 减速区(px): 加宽→更早减速, 根治过冲靶心 */
+#define TILT_GAIN       0.004f  /* Tilt 速度增益: 降低抑过冲 */
+#define TILT_DEC_ZONE   90.0f   /* Tilt 减速区(px): 加宽→更早减速, 垂直轴更柔 */
+#define CTRL_KD         0.0015f /* 接近阻尼: 加大抑制过冲(原 0.0005) */
 #define PID_ILIMIT      20.0f
-#define PID_DEADZONE    2       /* 死区 (像素) — Pan 轴 (收紧, 提升对中精度) */
-#define PID_DEADZONE_TILT 3     /* Tilt 轴死区 (收紧, 与 Pan 接近) */
+#define PID_DEADZONE    3       /* 死区 (像素) — Pan 轴 */
+#define PID_DEADZONE_TILT 4     /* Tilt 轴死区 */
+#define K230_HYST_PX    4       /* 滞回迟滞(px): 锁靶后误差需超 死区+此值 才重新驱动, 消除边界微抖 */
 
 /* ---- Tilt 垂直轴专用限制 (防"激光打到天上") ---- */
 /*   STEPPER_HALF_REV=4096 步 = 360°, 故 1 步 ≈ 0.088° */
 #define TILT_DEADZONE      4       /* 垂直轴死区(像素) — 收紧, 避免停在离靶心 8px 处 */
-#define TILT_MAX_STEPS     400     /* 垂直轴硬限位 = ±400步 ≈ ±35° (防打到天上) */
-#define PAN_MAX_STEPS      0       /* 恢复水平轴自由旋转(与改前一致); 若需限位可设大值如 2048(≈±180°) */
+#define TILT_MAX_STEPS     300     /* 垂直轴软限位 = ±300步 ≈ ±30° (1M 靶距足够, 垂直向不需大幅摆动) */
+#define PAN_MAX_STEPS      400     /* 水平轴软限位 = ±400步 ≈ ±40° (控转动范围, 防过冲/大幅摆动) */
 #define TILT_SPEED_SCALE   0.6f    /* 垂直轴最高速度 = Pan 的 60% (小幅缓动) */
 
 /* PID 实例: 字段全部用 K230_PID_Init 初始化 (见 main() 内调用) */
@@ -402,16 +404,16 @@ static float PosPID_Update(PosPID *pid, float err)
 #define POS_KD_TILT     0.00005f
 
 #define POS_DEADZONE_STEPS  2       /* 位置死区: 2步以内认为到位 */
-#define POS_LIMIT_PAN_MIN   -2048   /* Pan ±180° */
-#define POS_LIMIT_PAN_MAX   2048
-#define POS_LIMIT_TILT_MIN  -400    /* Tilt ±35° */
-#define POS_LIMIT_TILT_MAX  400
+#define POS_LIMIT_PAN_MIN   -1350   /* Pan ±135° (S20F 270° 舵机物理行程) */
+#define POS_LIMIT_PAN_MAX   1350
+#define POS_LIMIT_TILT_MIN  -800    /* Tilt ±80° (S20F 180° 舵机, 留 10° 余量防撞) */
+#define POS_LIMIT_TILT_MAX  800
 
 /* ---- 回程差补偿 (28BYJ-48 减速齿轮间隙) ----
  * 标准 28BYJ-48 64:1 减速箱回程差约 30~80 个半步步距.
  * 通过 serial 命令 'backlash <轴> <步数>' 可运行时调整并保存到 EEPROM.
  * 默认 50 步，对应约 4.4° 机械回程差。 */
-#define BACKLASH_STEPS_DEFAULT  50
+#define BACKLASH_STEPS_DEFAULT  0       /* 舵机基本无齿轮回程差, 默认 0 */
 static int32_t g_backlash_pan  = BACKLASH_STEPS_DEFAULT;
 static int32_t g_backlash_tilt = BACKLASH_STEPS_DEFAULT;
 /* 上次运动方向 (用于检测换向) */
@@ -446,14 +448,14 @@ static int32_t  g_trace_corners[4][2];   /* 4 个角 [Pan][Tilt] */
 static uint32_t g_trace_last_ms = 0;     /* 到角时间戳 */
 
 /* 丢步检测: 误差超过阈值且长时间不收敛则报警 */
-#define POS_LOSTSTEP_THRESH 2000   /* 2000步≈176°, 连续超过认为严重丢步/限位异常 */
+#define POS_LOSTSTEP_THRESH 3000   /* 3000步=300° (>舵机全行程2700步), 防止误报 */
 #define POS_LOSTSTEP_TIME_MS  3000   /* 持续3秒 */
 static uint32_t g_pos_loststep_start = 0;
 static uint8_t  g_pos_loststep_alarm = 0;
 
 /** @brief 方向反转标志 (上电默认 Pan/Tilt 都需要反转, 解决激光正反馈跑出视野) */
-static uint8_t g_pan_dir_invert = 1;    /* 默认反转, 发 i 命令切换 */
-static uint8_t g_tilt_dir_invert = 1;   /* 默认反转, 发 I 命令切换 */
+static uint8_t g_pan_dir_invert = 1;    /* 水平机械方向需反转(靶心/激光坐标系统一后实测为负反馈); 若进 AUTO 反向则发 i 翻转 */
+static uint8_t g_tilt_dir_invert = 0;   /* 默认不反转(负反馈); 若进 AUTO 冲到限位则发 I 翻转 */
 
 /* ========================== OLED 调试显示缓冲 ========================== */
 static char g_oled_cmd[20];             /* 最近收到的串口命令 (大写, 供 OLED 显示) */
@@ -512,34 +514,10 @@ void GPIO_Init(void)
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0 | GPIO_PIN_1, GPIO_PIN_RESET);
 
-    /* ---- PA4~PA7: Pan 电机 ULN2003 驱动板 IN1~IN4 (橙/粉/黄/蓝) ---- */
-    GPIO_InitStruct.Pin   = GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_RESET);  /* 初始全关 (电机滑行) */
-
-    /* ---- PB0: 未用 (原 STBY, 删) ---- */
-    /* ---- PB1: 未用 ---- */
-    GPIO_InitStruct.Pin   = GPIO_PIN_0 | GPIO_PIN_1;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_1, GPIO_PIN_RESET);
-
-    /* ---- PB3~PB6: Tilt 电机 ULN2003 驱动板 IN1~IN4 (橙/粉/黄/蓝) ---- */
-    GPIO_InitStruct.Pin   = GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6, GPIO_PIN_RESET);
-
-    /* ---- PB7: 未用 ---- */
-    GPIO_InitStruct.Pin   = GPIO_PIN_7;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+    /* ---- PA4, PA5: 未用 (舵机方案释放, 悬空输入) ---- */
+    /* ---- PA11: TIM1_CH4 (Tilt) 舵机 PWM, 在 TIM1_Init 中配置为复用推挽 ---- */
+    /* ---- PB1 : TIM3_CH4 (Pan)  舵机 PWM, 在 TIM3_Init 中配置为复用推挽 ---- */
+    /* ---- PB0~PB7: 舵机方案释放, 不再作步进驱动 (PB3/PB4 已 NOJTAG 释放) ---- */
 
     /* ---- PB12~PB15: 按键 (上拉输入) ---- */
     GPIO_InitStruct.Pin   = GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
@@ -764,25 +742,119 @@ void TIM2_Init(void)
     HAL_NVIC_EnableIRQ(TIM2_IRQn);
 }
 
-/* ========================== TIM3 初始化 (Tilt 电机步进节拍) ========================== */
+/* ========================== TIM1 初始化 (Tilt 舵机 PWM, 50Hz) ========================== */
+/* PA11 = TIM1_CH4 (Tilt 舵机) */
+
+void TIM1_Init(void)
+{
+    __HAL_RCC_TIM1_CLK_ENABLE();
+
+    /* PA11 配置为 TIM1_CH4 复用推挽 (Tilt) */
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin   = SERVO_TILT_PIN;  /* PA11 */
+    GPIO_InitStruct.Mode  = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(SERVO_TILT_PORT, &GPIO_InitStruct);
+
+    /* 50Hz PWM: PSC=72-1 → 1us tick, ARR=20000-1 → 20ms 周期 */
+    htim1.Instance               = TIM1;
+    htim1.Init.Prescaler         = 72 - 1;
+    htim1.Init.CounterMode       = TIM_COUNTERMODE_UP;
+    htim1.Init.Period            = 20000 - 1;
+    htim1.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
+    htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+    HAL_TIM_PWM_Init(&htim1);
+
+    TIM_OC_InitTypeDef oc = {0};
+    oc.OCMode       = TIM_OCMODE_PWM1;
+    oc.Pulse        = TILT_CENTER_US;       /* 上电中位 1500us */
+    oc.OCPolarity   = TIM_OCPOLARITY_HIGH;
+    oc.OCFastMode   = TIM_OCFAST_DISABLE;
+    HAL_TIM_PWM_ConfigChannel(&htim1, &oc, SERVO_TILT_CHANNEL);
+
+    HAL_TIM_PWM_Start(&htim1, SERVO_TILT_CHANNEL);
+
+    /* TIM1 仅作 Tilt PWM 输出, 不再用作步进节拍 (无 Update 中断) */
+}
+
+/* ========================== TIM3 初始化 (Pan 舵机 PWM, 50Hz) ========================== */
+/* PB1 = TIM3_CH4 (Pan 舵机) */
 
 void TIM3_Init(void)
 {
     __HAL_RCC_TIM3_CLK_ENABLE();
 
+    /* PB1 配置为 TIM3_CH4 复用推挽 (Pan) */
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin   = SERVO_PAN_PIN;  /* PB1 */
+    GPIO_InitStruct.Mode  = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(SERVO_PAN_PORT, &GPIO_InitStruct);
+
+    /* 50Hz PWM: PSC=72-1 → 1us tick, ARR=20000-1 → 20ms 周期 */
     htim3.Instance               = TIM3;
     htim3.Init.Prescaler         = 72 - 1;
     htim3.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim3.Init.Period            = STEPPER_DEFAULT_DELAY - 1;
+    htim3.Init.Period            = 20000 - 1;
     htim3.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
     htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-    HAL_TIM_Base_Init(&htim3);
+    HAL_TIM_PWM_Init(&htim3);
 
-    __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
-    HAL_TIM_Base_Start(&htim3);
+    TIM_OC_InitTypeDef oc = {0};
+    oc.OCMode       = TIM_OCMODE_PWM1;
+    oc.Pulse        = PAN_CENTER_US;       /* 上电中位 1500us */
+    oc.OCPolarity   = TIM_OCPOLARITY_HIGH;
+    oc.OCFastMode   = TIM_OCFAST_DISABLE;
+    HAL_TIM_PWM_ConfigChannel(&htim3, &oc, SERVO_PAN_CHANNEL);
 
-    HAL_NVIC_SetPriority(TIM3_IRQn, 1, 0);
-    HAL_NVIC_EnableIRQ(TIM3_IRQn);
+    HAL_TIM_PWM_Start(&htim3, SERVO_PAN_CHANNEL);
+
+    /* TIM3 仅作 Pan PWM 输出 */
+}
+
+/* ========================== 舵机 PWM 自检 (诊断用) ==========================
+ * 上电后让舵机在两个极限位置来回扫 3 次, 直接写 CCR 寄存器, 不经过状态机/中断.
+ * 如果舵机动了 → PWM 硬件和连接 OK; 不动 → 查供电或接线.
+ * ================================================================= */
+static void Servo_DiagTest(void)
+{
+    printf("\r\n[诊断] 舵机 PWM 自检 (3 次扫角)...\r\n");
+    for (int i = 0; i < 3; i++) {
+        /* 最大角度位置 */
+        __HAL_TIM_SET_COMPARE(&htim3, SERVO_PAN_CHANNEL,  PAN_PULSE_MAX_US);
+        __HAL_TIM_SET_COMPARE(&htim1, SERVO_TILT_CHANNEL, TILT_PULSE_MAX_US);
+        HAL_Delay(400);
+        /* 零度位置 */
+        __HAL_TIM_SET_COMPARE(&htim3, SERVO_PAN_CHANNEL,  PAN_PULSE_MIN_US);
+        __HAL_TIM_SET_COMPARE(&htim1, SERVO_TILT_CHANNEL, TILT_PULSE_MIN_US);
+        HAL_Delay(400);
+    }
+    /* 回中位 */
+    __HAL_TIM_SET_COMPARE(&htim3, SERVO_PAN_CHANNEL,  PAN_CENTER_US);
+    __HAL_TIM_SET_COMPARE(&htim1, SERVO_TILT_CHANNEL, TILT_CENTER_US);
+    printf("[诊断] 舵机自检完成, 已回中位\r\n");
+    HAL_Delay(200);
+}
+
+/* ========================== TIM4 初始化 (Tilt 电机步进节拍) ========================== */
+
+void TIM4_Init(void)
+{
+    __HAL_RCC_TIM4_CLK_ENABLE();
+
+    htim4.Instance               = TIM4;
+    htim4.Init.Prescaler         = 72 - 1;
+    htim4.Init.CounterMode       = TIM_COUNTERMODE_UP;
+    htim4.Init.Period            = STEPPER_DEFAULT_DELAY - 1;
+    htim4.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
+    htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+    HAL_TIM_Base_Init(&htim4);
+
+    __HAL_TIM_ENABLE_IT(&htim4, TIM_IT_UPDATE);
+    HAL_TIM_Base_Start(&htim4);
+
+    HAL_NVIC_SetPriority(TIM4_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(TIM4_IRQn);
 }
 
 /* ========================== NVIC 配置 ========================== */
@@ -846,6 +918,73 @@ int fputc(int ch, FILE *f)
     return ch;
 }
 #endif
+
+/* ========================== 帮助菜单 ========================== */
+static void PrintHelp(void)
+{
+    printf("\r\n");
+    printf("  ╔══════════════════════════════════════════╗\r\n");
+    printf("  ║           舵机云台 控制面板              ║\r\n");
+    printf("  ╠══════════════════════════════════════════╣\r\n");
+    printf("  ║ [位置]                                   ║\r\n");
+    printf("  ║   x<°>         Pan → 目标角度            ║\r\n");
+    printf("  ║   y<°>         Tilt → 目标角度            ║\r\n");
+    printf("  ║   home         双轴回零 (0°, 0°)          ║\r\n");
+    printf("  ║   z            当前位置归零                ║\r\n");
+    printf("  ╠══════════════════════════════════════════╣\r\n");
+    printf("  ║ [模式]                                   ║\r\n");
+    printf("  ║   k            K230 自动打靶模式           ║\r\n");
+    printf("  ║   m            手动/位置闭环模式            ║\r\n");
+    printf("  ║   stop         紧急停止                    ║\r\n");
+    printf("  ╠══════════════════════════════════════════╣\r\n");
+    printf("  ║ [PID 调参]                                ║\r\n");
+    printf("  ║   pid p/t kp/ki/kd <值>  位置环调参       ║\r\n");
+    printf("  ║   g p/t kp/ki/kd <值>    K230 追踪调参    ║\r\n");
+    printf("  ║                                         ║\r\n");
+    printf("  ╠══════════════════════════════════════════╣\r\n");
+    printf("  ║ [信息]                                   ║\r\n");
+    printf("  ║   help 或 ?   显示本菜单                  ║\r\n");
+    printf("  ║   status      显示当前状态                 ║\r\n");
+    printf("  ║   pid         显示位置环参数               ║\r\n");
+    printf("  ║   P           显示 K230 追踪参数           ║\r\n");
+    printf("  ║   tele on/off 遥测开关 (默认 off)          ║\r\n");
+    printf("  ╚══════════════════════════════════════════╝\r\n");
+    printf("\r\n");
+}
+
+/* ========================== 状态显示 ========================== */
+static void PrintStatus(void)
+{
+    float pa = PosCtrl_StepsToAngle(g_motor_pan.pos_steps);
+    float ta = PosCtrl_StepsToAngle(g_motor_tilt.pos_steps);
+    float pt = PosCtrl_StepsToAngle(g_pos_target_pan);
+    float tt = PosCtrl_StepsToAngle(g_pos_target_tilt);
+    const char *mode_str = "???";
+    switch (g_gimbal_mode) {
+        case GIMBAL_SERIAL:  mode_str = "串口"; break;
+        case GIMBAL_POSCTRL: mode_str = "位置闭环"; break;
+        case GIMBAL_AUTO:    mode_str = "K230 打靶"; break;
+        case GIMBAL_DANCE:   mode_str = "舞蹈"; break;
+        case GIMBAL_TRACE:   mode_str = "循迹"; break;
+    }
+    printf("\r\n");
+    printf("  ┌──────────┬────────┬────────┐\r\n");
+    printf("  │  轴      │  当前位置 │  目标  │\r\n");
+    printf("  ├──────────┼────────┼────────┤\r\n");
+    printf("  │  Pan     │ %+6.1f° │ %+6.1f° │\r\n", (double)pa, (double)pt);
+    printf("  │  Tilt    │ %+6.1f° │ %+6.1f° │\r\n", (double)ta, (double)tt);
+    printf("  ├──────────┴────────┴────────┤\r\n");
+    printf("  │  模式: %-16s    │\r\n", mode_str);
+    printf("  │  Pan PID: Kp=%.4f Ki=%.1f Kd=%.5f │\r\n",
+           (double)g_pos_pid_pan.kp, (double)g_pos_pid_pan.ki, (double)g_pos_pid_pan.kd);
+    printf("  │ Tilt PID: Kp=%.4f Ki=%.1f Kd=%.5f │\r\n",
+           (double)g_pos_pid_tilt.kp, (double)g_pos_pid_tilt.ki, (double)g_pos_pid_tilt.kd);
+    printf("  └─────────────────────────────┘\r\n");
+    printf("\r\n");
+}
+
+/* ========================== 遥测开关 ========================== */
+static uint8_t g_telemetry_enabled = 0;  /* 默认关闭遥测 */
 
 /* ========================== 串口命令执行 (在主循环调用, 非 ISR) ========================== */
 
@@ -972,6 +1111,36 @@ static void Serial_Execute(void)
         CmdReply("# OK 停止\r\n");
         return;
     }
+    if (strncmp(p, "help", 4) == 0 || strncmp(p, "HELP", 4) == 0) {
+        PrintHelp();
+        return;
+    }
+    if (strncmp(p, "status", 6) == 0 || strncmp(p, "STATUS", 6) == 0) {
+        PrintStatus();
+        return;
+    }
+    if (strncmp(p, "home", 4) == 0 || strncmp(p, "HOME", 4) == 0) {
+        g_pos_target_pan = 0;
+        g_pos_target_tilt = 0;
+        g_gimbal_mode = GIMBAL_POSCTRL;
+        g_feedback_until = HAL_GetTick() + 150;
+        CmdReply("# OK 双轴归零 (0°, 0°)\r\n");
+        return;
+    }
+    if (strncmp(p, "tele", 4) == 0 || strncmp(p, "TELE", 4) == 0) {
+        char *arg = p + 4;
+        while (*arg == ' ') arg++;
+        if (strncmp(arg, "on", 2) == 0 || strncmp(arg, "ON", 2) == 0) {
+            g_telemetry_enabled = 1;
+            CmdReply("# OK 遥测已开启 (每 100ms)\r\n");
+        } else if (strncmp(arg, "off", 3) == 0 || strncmp(arg, "OFF", 3) == 0) {
+            g_telemetry_enabled = 0;
+            CmdReply("# OK 遥测已关闭\r\n");
+        } else {
+            CmdReply("# tele on/off  — 遥测开关\r\n");
+        }
+        return;
+    }
 
     /* ---- K230 自动打靶模式: 锁定模式, 忽略串口误触 ----
      * 防止 CH340/蓝牙的 stray 字节把模式从 AUTO 踢出,
@@ -1047,10 +1216,8 @@ static void Serial_Execute(void)
                    g_tilt_dir_invert ? "ON (已反转)" : "OFF (正常)");
             return;
         case '?':
-            Stepper_PrintStatus(&g_motor_pan);    /* 详细步进状态→USART1(调试) */
-            Stepper_PrintStatus(&g_motor_tilt);
-            CmdReply("串口当前选中: %s\r\n", g_serial_motor->label);
-            CmdReply("# OK 状态已上报 (详情见调试串口 USART1)\r\n");
+            PrintHelp();
+            PrintStatus();
             return;
         case 'g': case 'G': {   /* 实时调参: g <p|t> <kp|ki|kd> <值> — 上位机 PID 调参面板用 */
             char axis = 0; char param[4] = {0}; float val = 0;
@@ -1207,15 +1374,15 @@ static void PosCtrl_Update(void)
     PosCtrl_RunAxis(&g_motor_tilt, &g_pos_pid_tilt, tilt_target, &g_pos_out_filt_tilt, 0.7f, "Tilt");
 }
 
-/* 角度 → 步数: 1步≈0.08789°, 4096步/圈 */
+/* 角度 → 步数: 舵机 1步=0.1°, 3600步/圈 */
 static int32_t PosCtrl_AngleToSteps(float angle)
 {
-    return (int32_t)(angle * (float)STEPPER_HALF_REV / 360.0f);
+    return (int32_t)(angle * (float)SERVO_STEPS_PER_REV / 360.0f);
 }
 
 static float PosCtrl_StepsToAngle(int32_t steps)
 {
-    return (float)steps * 360.0f / (float)STEPPER_HALF_REV;
+    return (float)steps * 360.0f / (float)SERVO_STEPS_PER_REV;
 }
 
 /* 位置闭环遥测: 100ms 发送一次 CSV 到 USART1 (CH340 调试口) */
@@ -1253,6 +1420,7 @@ static void PosCtrl_BacklashComp(StepperMotor *motor, int32_t *target,
 
 static void PosCtrl_SendTelemetry(void)
 {
+    if (!g_telemetry_enabled) return;
     if (HAL_GetTick() - pos_telemetry_tick < 100) return;
     pos_telemetry_tick = HAL_GetTick();
 
@@ -1343,10 +1511,17 @@ static void K230_SendStatus(void)
     uint8_t buf[8];
     buf[0] = 0x3C;
     buf[1] = 0x3D;
-    /* Yaw: Pan 位置估算 (0-255 → 0-270°) — 使用步序索引作为简易位置指示 */
-    buf[2] = (uint8_t)(g_motor_pan.step_index * 32);
-    /* Pitch: Tilt 位置估算 */
-    buf[3] = (uint8_t)(g_motor_tilt.step_index * 32);
+    /* Yaw/Pitch: 真实舵机位置 → 0~255 (各轴硬限位线性映射) */
+    int32_t p = g_motor_pan.pos_steps;
+    if (p < g_motor_pan.pos_limit_min_hard) p = g_motor_pan.pos_limit_min_hard;
+    if (p > g_motor_pan.pos_limit_max_hard) p = g_motor_pan.pos_limit_max_hard;
+    buf[2] = (uint8_t)((p - g_motor_pan.pos_limit_min_hard) * 255 /
+                        (g_motor_pan.pos_limit_max_hard - g_motor_pan.pos_limit_min_hard));
+    int32_t t = g_motor_tilt.pos_steps;
+    if (t < g_motor_tilt.pos_limit_min_hard) t = g_motor_tilt.pos_limit_min_hard;
+    if (t > g_motor_tilt.pos_limit_max_hard) t = g_motor_tilt.pos_limit_max_hard;
+    buf[3] = (uint8_t)((t - g_motor_tilt.pos_limit_min_hard) * 255 /
+                        (g_motor_tilt.pos_limit_max_hard - g_motor_tilt.pos_limit_min_hard));
     /* State: 双轴平均状态 */
     {
         uint8_t ps = (uint8_t)g_motor_pan.state;
@@ -1385,6 +1560,17 @@ static void K230_ControlAxis(StepperMotor *motor, K230_PID *pid,
 {
     /* 异常值保护 */
     if (abs(err) > K230_ERROR_MAX_PX) err = 0;
+
+    /* 滞回防抖: 已锁定时, 误差需超过 死区+迟滞 才解锁重新驱动, 否则保持停稳 */
+    if (pid->locked) {
+        if (abs(err) <= deadzone_px + K230_HYST_PX) {
+            if (Stepper_GetState(motor) != STATE_IDLE) Stepper_Stop(motor);
+            return;
+        } else {
+            pid->locked = 0;
+            K230_PID_Reset(pid);   /* 清除微分历史, 避免解锁瞬间 Kd 尖刺 */
+        }
+    }
 
     if (abs(err) > deadzone_px) {
         /* 卡尔曼平滑噪声 */
@@ -1462,19 +1648,59 @@ static void K230_ControlAxis(StepperMotor *motor, K230_PID *pid,
                    (unsigned long)final_delay, (long)Stepper_GetPosition(motor));
         }
     } else {
-        /* 死区内: 停止, 重置速度控制器 + 卡尔曼 + 滤波器 */
+        /* 死区内: 停止并锁存, 重置速度控制器 + 卡尔曼 + 滤波器 */
         if (Stepper_GetState(motor) != STATE_IDLE) {
             Stepper_Stop(motor);
         }
         K230_PID_Reset(pid);
         kf->init = 0;
         *out_filter = 0.0f;
+        pid->locked = 1;     /* 进入锁靶态, 后续靠滞回迟滞防抖 */
     }
 }
 
 /**
  * @brief 处理 K230 坐标帧，驱动 Pan/Tilt 电机
  *        主循环中调用，保证不会在 ISR 上下文中操作电机
+ */
+static uint8_t g_conf_streak = 0;   /* 置信度连续有效帧计数(去抖) */
+
+/**
+ * @brief 冻结云台 - 检测不可靠/丢失时停机并重置控制器, 防止用脏数据做闭环
+ */
+static void K230_Freeze(const char *reason)
+{
+    if (Stepper_GetState(&g_motor_pan)  != STATE_IDLE) Stepper_Stop(&g_motor_pan);
+    if (Stepper_GetState(&g_motor_tilt) != STATE_IDLE) Stepper_Stop(&g_motor_tilt);
+    K230_PID_Reset(&g_pid_pan);
+    K230_PID_Reset(&g_pid_tilt);
+    g_pid_pan.locked  = 0;
+    g_pid_tilt.locked = 0;
+    g_pan_out_filter  = 0.0f;
+    g_tilt_out_filter = 0.0f;
+    g_kf_x.init = 0; g_kf_y.init = 0;
+    g_conf_streak = 0;
+    static uint32_t last_print = 0;
+    uint32_t now = HAL_GetTick();
+    if (now - last_print > 1000) {
+        last_print = now;
+        printf("\r\n[K230] 冻结云台: %s\r\n", reason);
+    }
+}
+
+/**
+ * @brief 处理 K230 坐标帧，驱动 Pan/Tilt 电机
+ *        主循环中调用，保证不会在 ISR 上下文中操作电机
+ *
+ * 坐标系统一约定 (图像坐标系 -> 云台物理运动):
+ *   err_x = 靶心_x - 激光_x  (图像 x 向右为正)
+ *   err_y = 靶心_y - 激光_y  (图像 y 向下为正)
+ *   闭环目标: 让激光移动到靶心, 即消除 err。
+ *   控制量符号: dir_out = invert ? -vel : vel;  dir_out>=0 -> DIR_CW -> 位置计数+。
+ *   机械安装方向差异由 per-axis invert 吸收:
+ *     Pan : g_pan_dir_invert  = 1  (水平机械方向需反转)
+ *     Tilt: g_tilt_dir_invert = 0
+ *   -> 两轴共用同一控制函数与符号约定, 仅 invert 不同, 坐标系统一。
  */
 static void K230_ProcessFrame(void)
 {
@@ -1486,14 +1712,18 @@ static void K230_ProcessFrame(void)
     uint8_t flags = g_k230_flags;
     uint8_t valid = flags & 0x01;
     uint8_t hit   = flags & 0x02;
+    uint8_t conf  = flags & 0x04;   /* 高置信度(置信度检测通过) */
 
     /* 更新时间戳 */
     g_k230_last_frame = HAL_GetTick();
 
+    /* ---- 置信度门控: 必须靶心+激光都识别(valid)才控制; 否则冻结(停机+重置) ---- */
     if (!valid) {
-        /* v4.15: valid=0 时不要急停, 让电机保持当前运动.
-         * 超时停止由主循环中的 K230_TIMEOUT 检查负责. */
+        K230_Freeze("目标/激光丢失(valid=0)");
         return;
+    }
+    if (++g_conf_streak < 2) {
+        return;   /* 置信度刚建立, 等稳 1 帧再驱动 */
     }
 
     /* 循迹测试模式: 忽略 K230 坐标, 不切 AUTO */
@@ -1501,6 +1731,10 @@ static void K230_ProcessFrame(void)
 
     /* 记录最后有效帧时间 */
     g_k230_last_valid = HAL_GetTick();
+
+    /* 置信度决定精度: conf=1 精确模式(紧死区, 可命中); conf=0 粗跟模式(宽死区, 不追噪声尖端) */
+    int16_t pan_dz  = conf ? PID_DEADZONE     : (PID_DEADZONE + 6);
+    int16_t tilt_dz = conf ? TILT_DEADZONE     : (TILT_DEADZONE + 6);
 
     /* 切换到自动打靶模式:
      *   - 开机前 3 秒不进 AUTO (防"上电就乱转")
@@ -1518,20 +1752,32 @@ static void K230_ProcessFrame(void)
         printf("\r\n[K230] → 自动打靶 双轴控制\n");
     }
 
-    /* ---- Pan 轴 (X 误差) ——— 自由旋转, 标准死区 ---- */
+    /* ---- Pan 轴 (X 误差) 软限位 ±40°, 置信度决定死区 ---- */
     K230_ControlAxis(&g_motor_pan, &g_pid_pan, err_x, &g_kf_x,
                      g_pan_dir_invert, "Pan", &g_pan_out_filter,
-                     PID_DEADZONE, PAN_MAX_STEPS, 1.0f);
+                     pan_dz, PAN_MAX_STEPS, 1.0f);
 
-    /* ---- Tilt 轴 (Y 误差) ——— 双轴闭环打靶, 限幅防"打到天上" ---- */
+    /* ---- Tilt 轴 (Y 误差) 软限位 ±30°, 置信度决定死区 ---- */
     K230_ControlAxis(&g_motor_tilt, &g_pid_tilt, err_y, &g_kf_y,
                      g_tilt_dir_invert, "Tilt", &g_tilt_out_filter,
-                     TILT_DEADZONE, TILT_MAX_STEPS, TILT_SPEED_SCALE);
+                     tilt_dz, TILT_MAX_STEPS, TILT_SPEED_SCALE);
 
-    /* 命中反馈 */
-    if (hit) {
+    /* 命中保持: K230 确认靶心锁定(hit=1) → 双轴锁靶不抖, 激光稳稳压在目标上 */
+    if (hit && conf) {
         g_feedback_until = HAL_GetTick() + 200;
         LED_ON();
+        if (!g_locked_feedback) {
+            g_locked_feedback = 1;
+            printf("\r\n[K230] 命中锁定, 双轴保持\r\n");
+        }
+        Stepper_Stop(&g_motor_pan);
+        Stepper_Stop(&g_motor_tilt);
+        K230_PID_Reset(&g_pid_pan);
+        K230_PID_Reset(&g_pid_tilt);
+        g_pid_pan.locked  = 1;   /* 锁靶, 后续靠滞回迟滞防抖 */
+        g_pid_tilt.locked = 1;
+    } else {
+        g_locked_feedback = 0;   /* 目标移动, 解除提示, 下一帧恢复追踪 */
     }
 }
 
@@ -1989,6 +2235,19 @@ int main(void)
     HAL_Init();
     SystemClock_Config();
 
+    /* 【关键】立即喂狗 — 若选项字节开启了 IWDG, 上电即开始计数, 不喂狗约 1s 后复位 */
+    IWDG_FEED();
+
+    /* 心跳: PC13 LED 闪烁 3 次确认 MCU 运行 */
+    GPIO_InitTypeDef gpio_led = {0};
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    gpio_led.Pin = GPIO_PIN_13;
+    gpio_led.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio_led.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &gpio_led);
+    for (int i=0; i<3; i++) { HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET); HAL_Delay(100); HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET); HAL_Delay(100); }
+    /* 注意: GPIO_Init() 中会重新初始化 PC13, 上面的闪烁仅用于诊断 */
+
     GPIO_Init();
     USART1_Init();
     USART2_Init();
@@ -2026,14 +2285,35 @@ int main(void)
             printf("      ④ 模块 SCK/SDA 引脚接了 4.7kΩ 上拉到 3.3V? (部分模块不自带上拉)\r\n");
         }
     }
+    IWDG_FEED();    /* OLED 初始化有多个 HAL_Delay, 喂狗防复位 */
 
-    /* 初始化两个步进电机 (Pan + Tilt) */
-    Stepper_Init(&g_motor_pan,  &g_pan_pins,  &htim2, "Pan");
-    Stepper_Init(&g_motor_tilt, &g_tilt_pins, &htim3, "Tilt");
+    /* 先初始化定时器硬件, 再初始化舵机 (Stepper_Init 内调 Servo_UpdatePWM 需要 htim1/htim3.Instance != NULL) */
+    TIM1_Init();        /* Tilt 舵机 PWM 定时器 (PA11=TIM1_CH4) */
+    IWDG_FEED();
+    TIM3_Init();        /* Pan 舵机 PWM 定时器 (PB1=TIM3_CH4) */
+    IWDG_FEED();
+    TIM2_Init();        /* Pan 步进节拍定时器 */
+    IWDG_FEED();
+    TIM4_Init();        /* Tilt 步进节拍定时器 */
+    IWDG_FEED();
 
-    /* 启动两个步进定时器 */
-    TIM2_Init();
-    TIM3_Init();
+    /* 初始化两个舵机 (PWM 定时器已就绪, 可以安全写入 CCR)
+     * Pan : S20F 270° 舵机, TIM2节拍 + TIM3_CH4(PB1) PWM
+     * Tilt: S20F 180° 舵机, TIM4节拍 + TIM1_CH4(PA11) PWM */
+    Stepper_Init(&g_motor_pan,  &htim2, &htim3, SERVO_PAN_CHANNEL,
+                  PAN_PULSE_MIN_US, PAN_PULSE_MAX_US, PAN_CENTER_US, PAN_US_PER_DEG,
+                  POS_LIMIT_PAN_MIN, POS_LIMIT_PAN_MAX,
+                  "Pan");
+    IWDG_FEED();
+    Stepper_Init(&g_motor_tilt, &htim4, &htim1, SERVO_TILT_CHANNEL,
+                  TILT_PULSE_MIN_US, TILT_PULSE_MAX_US, TILT_CENTER_US, TILT_US_PER_DEG,
+                  POS_LIMIT_TILT_MIN, POS_LIMIT_TILT_MAX,
+                  "Tilt");
+    IWDG_FEED();
+
+    /* 舵机 PWM 自检 (仅诊断用, 不影响后续控制) */
+    Servo_DiagTest();
+    IWDG_FEED();
 
     /* v4.10: 初始化两个 PID 控制器 (设置基础增益/段增益/微分滤波/退饱和等所有参数) */
     K230_PID_Init(&g_pid_pan,  PAN_GAIN, PAN_DEC_ZONE,  CTRL_KD, (float)PID_DEADZONE);
@@ -2049,21 +2329,14 @@ int main(void)
     /* 用户要求: 上电电机不动, 收到串口/蓝牙命令才动 */
     /* (电机初始化后处于 idle 状态, step 0 保持力矩) */
 
-    printf("\r\n========================================\r\n");
-    printf("  28BYJ-48 双轴云台 Demo 已就绪\r\n");
-    printf("  STM32F103C8T6 @ 72MHz\r\n");
-    printf("  电机: Pan(水平) + Tilt(垂直)\r\n");
-    printf("  位置闭环: 串口目标角度/调PID, 100ms 遥测\r\n");
-    printf("  K230: 发 'k' 切换到自动打靶模式\r\n");
-    printf("========================================\r\n\r\n");
-    printf("[云台] 默认位置闭环模式. 发送 ? 查看命令\r\n");
-    printf("  x<角度>  y<角度>  设置目标角度(°)\r\n");
-    printf("  pid p kp 0.001     设置 Pan 位置环 Kp\r\n");
-    printf("  pid p ki 0.00001   设置 Pan 积分 Ki\r\n");
-    printf("  pid p kd 0.00005   设置 Pan 微分 Kd\r\n");
-    printf("  z                  当前位置归零\r\n");
-    printf("  s                  停止\r\n");
-    printf("  k                  切换 K230 自动打靶模式\r\n\r\n");
+    printf("\r\n");
+    printf("  ╔═══════════════════════════╗\r\n");
+    printf("  ║   舵机云台 控制系统 V1.0   ║\r\n");
+    printf("  ║   STM32F103C8T6 @ 72MHz  ║\r\n");
+    printf("  ║   Pan: PB1  Tilt: PA11   ║\r\n");
+    printf("  ╚═══════════════════════════╝\r\n");
+    printf("  输入 help 查看命令菜单\r\n");
+    printf("  例: x30 y10 → Pan=30°, Tilt=10°\r\n\r\n");
 
     while (1) {
         /* [修复] 串口命令在主循环处理，避免 printf 在 ISR 中阻塞 */
@@ -2133,6 +2406,7 @@ int main(void)
         }
 
         /* 蓝牙链路健康检测 + 重连指示 (每 500ms) */
+        IWDG_FEED();    /* 主循环喂狗 — IWDG 超时约 1s, 循环内至少每秒喂 1 次 */
         static uint32_t bt_link_tick = 0;
         if (HAL_GetTick() - bt_link_tick >= 500) {
             bt_link_tick = HAL_GetTick();
@@ -2175,13 +2449,13 @@ void TIM2_IRQHandler(void)
 }
 
 /**
- * @brief TIM3 中断 — Tilt 电机步进节拍
+ * @brief TIM4 中断 — Tilt 电机步进节拍 (TIM3 现为 Pan 舵机 PWM 输出)
  */
-void TIM3_IRQHandler(void)
+void TIM4_IRQHandler(void)
 {
-    if (__HAL_TIM_GET_FLAG(&htim3, TIM_FLAG_UPDATE) != RESET) {
-        if (__HAL_TIM_GET_IT_SOURCE(&htim3, TIM_IT_UPDATE) != RESET) {
-            __HAL_TIM_CLEAR_IT(&htim3, TIM_IT_UPDATE);
+    if (__HAL_TIM_GET_FLAG(&htim4, TIM_FLAG_UPDATE) != RESET) {
+        if (__HAL_TIM_GET_IT_SOURCE(&htim4, TIM_IT_UPDATE) != RESET) {
+            __HAL_TIM_CLEAR_IT(&htim4, TIM_IT_UPDATE);
             Stepper_TIM_IRQHandler(&g_motor_tilt);
         }
     }

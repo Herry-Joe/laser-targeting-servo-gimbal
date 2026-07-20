@@ -1,139 +1,92 @@
 /**
  * @file    stepper.c
- * @brief   28BYJ-48 步进电机驱动实现 — ULN2003 四相达林顿管驱动板版本 (多实例)
+ * @brief   舵机 (Servo) 二维云台驱动实现 — STM32F103C8T6 TIM3 PWM 输出 (多实例)
  *
  * === 硬件连接说明 ==============================================
  *
- *  ULN2003 (4路)              28BYJ-48 (5线)         STM32F103C8T6
- *  ┌──────────┐             ┌──────────┐           ┌──────────────┐
- *  │ 5-12V ──────────────>   │ 红 (COM) │─── 5V     │              │
- *  │ GND  ──────────────────────────────  ───>    │ GND          │
- *  │ IN1   ──────────────────────────  橙 (Coil1)│              │ ──> ain1_pin
- *  │ IN2   ──────────────────────────  粉 (Coil2)│              │ ──> ain2_pin
- *  │ IN3   ──────────────────────────  黄 (Coil3)│              │ ──> bin1_pin
- *  │ IN4   ──────────────────────────  蓝 (Coil4)│              │ ──> bin2_pin
- *  └──────────┘
+ *  STM32F103C8T6                舵机 (270° 标准舵机)
+ *  ┌──────────────┐            ┌──────────────┐
+ *  │ PA6 (TIM3_CH1) ────────>  │ Pan  舵机 PWM │
+ *  │ PA7 (TIM3_CH2) ────────>  │ Tilt 舵机 PWM │
+ *  │ 5V ───────────────────>   │ VCC          │
+ *  │ GND ───────────────────>  │ GND          │
+ *  └──────────────┘            └──────────────┘
  *
- *  ULN2003: INx=HIGH → 输出拉低到 GND → 线圈通电 (COM=5V)
- *
- * === 步进序列 (ULN2003 直接驱动 4 相) ==============================
- *
- *  半步步进序列 (8拍)，bit[3:0] = (IN4, IN3, IN2, IN1):
- *   拍号 | 橙 A | 粉 B | 黄 C | 蓝 D | 编码
- *   ─────┼──────┼──────┼──────┼──────┼──────
- *    0   |  ON  |      |      |      |  0x01
- *    1   |  ON  |  ON  |      |      |  0x03
- *    2   |      |  ON  |      |      |  0x02
- *    3   |      |  ON  |  ON  |      |  0x06
- *    4   |      |      |  ON  |      |  0x04
- *    5   |      |      |  ON  |  ON  |  0x0C
- *    6   |      |      |      |  ON  |  0x08
- *    7   |  ON  |      |      |  ON  |  0x09
- *
- *  全步进序列 (4拍，2相)：取奇数拍 0x03, 0x06, 0x0C, 0x09
- *  波驱动序列 (4拍，1相)：取偶数拍 0x01, 0x02, 0x04, 0x08
+ * === 设计要点 ==================================================
+ *  本模块把"虚拟步进"模型 (pos_steps, 单位 0.1°) 复用到舵机上, 以最大限度
+ *  复用原 K230 视觉闭环 / 位置闭环 PID 算法, 仅替换最底层驱动方式:
+ *   - 原方案: GPIO 4 相步进序列 → 28BYJ-48 旋转
+ *   - 本方案: 每个节拍定时器 (TIM2=Pan, TIM4=Tilt) 的 Update 中断里,
+ *             pos_steps 按方向 ±1 (0.1°), 再映射成舵机脉宽写入 TIM3 CCR。
+ *   - 舵机自身以机械响应速度逼近"指令位置", 因此云台实际运动速度由节拍
+ *     周期 step_delay_us 决定 (1 步 = 0.1°, 周期越短转得越快)。
  */
 
 #include "stepper.h"
 #include <stdlib.h>
+#include <string.h>
+#include <math.h>   /* fabsf */
 
-/* ========================== 步进序列查找表 ========================== */
-
-/**
- * @brief 半步步进序列 (8 拍) — ULN2003 4-bit 直接编码
- *
- * 采用 Arduino 社区通用 28BYJ-48+ULN2003 标准步进序列:
- *   IN1→A, IN2→B, IN3→C, IN4→D
- *   板上丝印: A=蓝(Coil4), B=粉(Coil2), C=黄(Coil3), D=橙(Coil1)
- *
- * bit[3:0] = (IN4, IN3, IN2, IN1)
- */
-static const uint8_t half_step_seq[8] = {
-    0x01,   /* IN1=A=蓝 */
-    0x03,   /* A+B=蓝+粉 */
-    0x02,   /* B=粉 */
-    0x06,   /* B+C=粉+黄 */
-    0x04,   /* C=黄 */
-    0x0C,   /* C+D=黄+橙 */
-    0x08,   /* D=橙 */
-    0x09,   /* D+A=橙+蓝 */
-};
-
-/** @brief 全步进序列 (4拍, 2相) */
-static const uint8_t full_step_seq[4] = {
-    0x03,   /* A+B=蓝+粉 */
-    0x06,   /* B+C=粉+黄 */
-    0x0C,   /* C+D=黄+橙 */
-    0x09,   /* D+A=橙+蓝 */
-};
-
-/** @brief 波驱动序列 (4拍, 1相) */
-static const uint8_t wave_step_seq[4] = {
-    0x01,   /* A=蓝 */
-    0x02,   /* B=粉 */
-    0x04,   /* C=黄 */
-    0x08,   /* D=橙 */
-};
-
-/* ========================== 底层硬件操作 ========================== */
+/* ========================== 底层 PWM 操作 ========================== */
 
 /**
- * @brief 直接输出 4-bit 步进码到 ULN2003 IN1~IN4
- * @param step_code bit[3:0]=(IN4,IN3,IN2,IN1)
+ * @brief 将当前指令位置 pos_steps (0.1°/步) 映射为舵机脉宽并写入 CCR
+ *
+ * 使用该轴独立的脉宽映射参数 (motor->pulse_min/max/center_us):
+ *   Pan  270°: 500us=0° ~ 2500us=270°, 中位1500us=135°
+ *   Tilt 180°: 500us=0° ~ 2500us=180°, 中位1500us=90°
  */
-static inline void Stepper_OutputStep(StepperMotor *motor, uint8_t step_code)
+static void Servo_UpdatePWM(StepperMotor *motor)
 {
-    HAL_GPIO_WritePin(motor->pins.ain1_port, motor->pins.ain1_pin,
-                      (step_code & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET);  /* IN1 → A → 蓝(CoilD) */
-    HAL_GPIO_WritePin(motor->pins.ain2_port, motor->pins.ain2_pin,
-                      (step_code & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET);  /* IN2 → B → 粉(CoilB) */
-    HAL_GPIO_WritePin(motor->pins.bin1_port, motor->pins.bin1_pin,
-                      (step_code & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET);  /* IN3 → C → 黄(CoilC) */
-    HAL_GPIO_WritePin(motor->pins.bin2_port, motor->pins.bin2_pin,
-                      (step_code & 0x08) ? GPIO_PIN_SET : GPIO_PIN_RESET);  /* IN4 → D → 橙(CoilA) */
-}
+    int32_t p = motor->pos_steps;
 
-/** @brief 全部线圈断电 (ULN2003 输入全 0 → 全部浮空, 电机滑行) */
-static inline void Stepper_Coast(StepperMotor *motor)
-{
-    Stepper_OutputStep(motor, 0x00);
+    /* 限制到该轴硬限位 */
+    if (p < motor->pos_limit_min_hard) p = motor->pos_limit_min_hard;
+    if (p > motor->pos_limit_max_hard) p = motor->pos_limit_max_hard;
+
+    /* 角度(°) = 步数 / 每度步数 */
+    float deg = (float)p / (float)SERVO_STEPS_PER_DEG;
+
+    /* 脉宽(us) = 中位脉宽 + 角度 * 该轴 us/° */
+    int32_t pulse = (int32_t)(motor->center_us + deg * motor->us_per_deg);
+    if (pulse < motor->pulse_min_us) pulse = motor->pulse_min_us;
+    if (pulse > motor->pulse_max_us) pulse = motor->pulse_max_us;
+
+    __HAL_TIM_SET_COMPARE(motor->htim_pwm, motor->pwm_channel, (uint32_t)pulse);
 }
 
 /* ========================== 步进电机核心逻辑 ========================== */
 
 static uint8_t Stepper_AdvanceOneStep(StepperMotor *motor)
 {
-    const uint8_t *seq;
-    uint8_t max_steps;
-
-    if (motor->mode == STEP_MODE_HALF) {
-        seq = half_step_seq;
-        max_steps = 8;
-    } else if (motor->mode == STEP_MODE_WAVE) {
-        seq = wave_step_seq;
-        max_steps = 4;
-    } else {
-        seq = full_step_seq;
-        max_steps = 4;
-    }
-
-    /* 更新步序索引 (CW 递增, CCW 递减) */
-    if (motor->dir == DIR_CW) {
-        motor->step_index = (motor->step_index + 1) % max_steps;
-    } else {
-        motor->step_index = (motor->step_index == 0)
-                            ? (max_steps - 1)
-                            : (motor->step_index - 1);
-    }
-
-    Stepper_OutputStep(motor, seq[motor->step_index]);
-
-    /* 绝对位置累计 (CW 正向, CCW 负向) — 用于 Tilt 限位防"打到天上" */
+    /* 绝对位置累计 (CW 正向, CCW 负向) */
     if (motor->dir == DIR_CW) {
         motor->pos_steps++;
     } else {
         motor->pos_steps--;
     }
+
+    motor->step_index = (motor->step_index + 1) & 0x07;  /* 仅用于遥测/心跳 */
+
+    /* 舵机物理行程保护: 触底即停 (使用该轴硬限位) */
+    if (motor->pos_steps <= motor->pos_limit_min_hard) {
+        motor->pos_steps = motor->pos_limit_min_hard;
+        if (motor->work_mode == WORK_MODE_SWEEP) {
+            motor->dir = DIR_CW;
+        } else {
+            motor->state = STATE_IDLE;
+        }
+    } else if (motor->pos_steps >= motor->pos_limit_max_hard) {
+        motor->pos_steps = motor->pos_limit_max_hard;
+        if (motor->work_mode == WORK_MODE_SWEEP) {
+            motor->dir = DIR_CCW;
+        } else {
+            motor->state = STATE_IDLE;
+        }
+    }
+
+    /* 写入舵机 PWM (指令位置更新) */
+    Servo_UpdatePWM(motor);
 
     /* 目标步数递减 */
     if (motor->target_steps > 0) {
@@ -144,7 +97,7 @@ static uint8_t Stepper_AdvanceOneStep(StepperMotor *motor)
                 /* 保持运行状态，IRQ 中 target_steps <= 0 触发换向 */
             } else {
                 motor->state = STATE_IDLE;
-                /* [修复] 旋转完成后恢复原始方向 */
+                /* 旋转完成后恢复原始方向 */
                 if (motor->restore_dir_flag) {
                     motor->dir = motor->saved_dir;
                     motor->restore_dir_flag = 0;
@@ -158,49 +111,55 @@ static uint8_t Stepper_AdvanceOneStep(StepperMotor *motor)
 
 /* ========================== 公共接口实现 ========================== */
 
-void Stepper_Init(StepperMotor *motor, const StepperPins *pins,
-                  TIM_HandleTypeDef *htim, const char *label)
+void Stepper_Init(StepperMotor *motor, TIM_HandleTypeDef *htim_step,
+                  TIM_HandleTypeDef *htim_pwm, uint32_t pwm_channel,
+                  int32_t pmin_us, int32_t pmax_us, int32_t center_us,
+                  float us_per_deg,
+                  int32_t pos_min_hard, int32_t pos_max_hard,
+                  const char *label)
 {
     memset(motor, 0, sizeof(StepperMotor));
 
-    motor->mode           = STEP_MODE_HALF;   /* 平滑: 半步进 (1.5相平均 ~300mA/轴) */
+    motor->mode           = STEP_MODE_HALF;   /* 占位 (舵机无步进模式概念) */
     motor->dir            = DIR_CW;
     motor->state          = STATE_IDLE;
     motor->work_mode      = WORK_MODE_MANUAL;
     motor->step_delay_us  = STEPPER_DEFAULT_DELAY;
-    motor->angle_limit_steps = STEPPER_HALF_REV / 4;
-    motor->htim           = htim;
+    motor->angle_limit_steps = SERVO_STEPS_PER_REV / 4;  /* 默认扫描 ±90° */
+    motor->htim           = htim_step;        /* 步进节拍定时器 (TIM2/TIM4) */
+    motor->htim_pwm       = htim_pwm;         /* 舵机 PWM 定时器 (TIM1) */
+    motor->pwm_channel    = pwm_channel;      /* TIM_CHANNEL_x */
+
+    /* 每轴独立脉宽映射 */
+    motor->pulse_min_us       = pmin_us;
+    motor->pulse_max_us       = pmax_us;
+    motor->center_us          = center_us;
+    motor->us_per_deg         = us_per_deg;
+    motor->pos_limit_min_hard = pos_min_hard;
+    motor->pos_limit_max_hard = pos_max_hard;
+
     motor->soft_start     = 0;
     motor->soft_start_delay = 0;
-    motor->pos_steps      = 0;   /* 上电位置记为绝对零点 */
+    motor->pos_steps      = 0;   /* 上电位置记为绝对零点 (舵机中位) */
 
-    if (pins) {
-        motor->pins = *pins;
-    }
     if (label) {
         strncpy(motor->label, label, sizeof(motor->label) - 1);
         motor->label[sizeof(motor->label) - 1] = '\0';
     }
 
-    /* 上电不输出励磁, 避免电机瞬间大电流把蓝牙模块电压拉垮 */
-    /* 等收到串口命令时 Stepper_RunContinuously / StepBy 才会通电 */
-    Stepper_Coast(motor);
+    /* 上电将舵机置于中位 (pos_steps=0 → center_us), 避免舵机上电乱摆 */
+    Servo_UpdatePWM(motor);
 
-    printf("\r\n%s 电机初始化完成\r\n", motor->label);
+    printf("\r\n%s 舵机初始化完成 (PWM: %d~%dus, 中位%dbus, 行程±%.0f°)\r\n",
+           motor->label, (int)pmin_us, (int)pmax_us, (int)center_us,
+           (double)(pos_max_hard / SERVO_STEPS_PER_DEG));
 }
 
 void Stepper_SetMode(StepperMotor *motor, StepMode mode)
 {
     motor->mode = mode;
-    /* [修复] 切换模式时复位步序索引，防止数组越界 */
-    motor->step_index = 0;
-    /* 输出新模式第一拍，保持线圈励磁 */
-    Stepper_OutputStep(motor,
-        (mode == STEP_MODE_HALF) ? half_step_seq[0] :
-        (mode == STEP_MODE_WAVE) ? wave_step_seq[0] : full_step_seq[0]);
-    printf("[%s] %s\r\n", motor->label,
-           (mode == STEP_MODE_HALF) ? "半步步进" :
-           (mode == STEP_MODE_WAVE) ? "波驱动(省电)" : "全步步进");
+    /* [舵机] 步进模式已无意义, 仅记录并打印 */
+    printf("[%s] 舵机模式已设置 (PWM 驱动, 无步进模式)\r\n", motor->label);
 }
 
 void Stepper_SetDirection(StepperMotor *motor, Direction dir)
@@ -330,7 +289,9 @@ void Stepper_ZeroPosition(StepperMotor *motor)
     motor->pos_steps = 0;
     motor->target_pos = 0;
     __enable_irq();
-    printf("[%s] 位置归零\r\n", motor->label);
+    /* 立即把舵机指令到中位 */
+    Servo_UpdatePWM(motor);
+    printf("[%s] 位置归零 (舵机回中位)\r\n", motor->label);
 }
 
 int32_t Stepper_GetTargetPosition(const StepperMotor *motor)
@@ -350,14 +311,10 @@ void Stepper_StepBy(StepperMotor *motor, uint32_t steps)
 
 void Stepper_RotateDegrees(StepperMotor *motor, float degrees)
 {
-    uint32_t steps_per_rev;
     uint32_t steps;
 
-    steps_per_rev = (motor->mode == STEP_MODE_HALF)
-                    ? STEPPER_HALF_REV : STEPPER_FULL_REV;
-
-    float abs_degrees = (degrees < 0.0f) ? -degrees : degrees;
-    steps = (uint32_t)((abs_degrees / 360.0f) * (float)steps_per_rev);
+    /* [舵机] 固定 3600 步/圈 (0.1°/步) */
+    steps = (uint32_t)((fabsf(degrees) / 360.0f) * (float)SERVO_STEPS_PER_REV);
 
     /* [修复] 保存当前方向，旋转完成后恢复 */
     __disable_irq();
@@ -385,11 +342,8 @@ void Stepper_SweepEnable(StepperMotor *motor, uint32_t limit_degrees)
     if (limit_degrees > 360) limit_degrees = 360;
     if (limit_degrees == 0)  limit_degrees = 90;
 
-    uint32_t steps_per_rev = (motor->mode == STEP_MODE_HALF)
-                             ? STEPPER_HALF_REV : STEPPER_FULL_REV;
-
     motor->angle_limit_steps = (uint32_t)(
-        ((float)limit_degrees / 360.0f) * (float)steps_per_rev
+        ((float)limit_degrees / 360.0f) * (float)SERVO_STEPS_PER_REV
     );
 
     motor->work_mode = WORK_MODE_SWEEP;
@@ -409,9 +363,8 @@ void Stepper_Stop(StepperMotor *motor)
     motor->target_steps = 0;
     motor->work_mode = WORK_MODE_MANUAL;
     __enable_irq();
-    /* 不调用 Stepper_Coast: 保持当前步序的线圈励磁, 输出保持力矩,
-     * 云台不会因重力而下垂。若需自由滑行, 可调用 Stepper_Coast */
-    printf("[%s] 停止 (保持力矩)\r\n", motor->label);
+    /* 舵机: 不改写 PWM, 保持最后指令位置 (舵机自锁, 云台不下垂) */
+    printf("[%s] 停止 (舵机保持位置)\r\n", motor->label);
 }
 
 /* ========================== 定时器中断处理 ========================== */
@@ -498,18 +451,18 @@ int32_t Stepper_GetPosition(const StepperMotor *motor)
 
 void Stepper_PrintStatus(const StepperMotor *motor)
 {
-    const char *mode_str[]  = {"全步步进", "半步步进", "波驱动(省电)"};
     const char *dir_str[]   = {"顺时针(CW)", "逆时针(CCW)"};
     const char *state_str[] = {"空闲", "连续运行", "定步运行", "定角运行"};
     const char *work_str[]  = {"手动", "扫描", "串口", "位置闭环"};
 
-    printf("\r\n========== %s 电机状态 ==========\r\n", motor->label);
-    printf(" 步进模式 : %s\r\n",   mode_str[motor->mode]);
+    printf("\r\n========== %s 舵机状态 ==========\r\n", motor->label);
+    printf(" 驱动方式 : 舵机 PWM (TIM3)\r\n");
     printf(" 旋转方向 : %s\r\n",   dir_str[motor->dir]);
     printf(" 运行状态 : %s\r\n",   state_str[motor->state]);
     printf(" 工作模式 : %s\r\n",   work_str[motor->work_mode]);
-    printf(" 当前速度 : %lu us/步\r\n", (unsigned long)motor->step_delay_us);
-    printf(" 当前步序 : %d\r\n",   motor->step_index);
+    printf(" 指令周期 : %lu us/步\r\n", (unsigned long)motor->step_delay_us);
+    printf(" 当前位置 : %ld 步 (%.1f°)\r\n",
+           (long)motor->pos_steps, (double)((float)motor->pos_steps / (float)SERVO_STEPS_PER_DEG));
     printf(" 剩余步数 : %ld\r\n",  (long)motor->target_steps);
     printf("===============================\r\n\r\n");
 }
