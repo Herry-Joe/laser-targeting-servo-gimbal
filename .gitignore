@@ -24,3 +24,6 @@ firmware.bin
 # OS
 .DS_Store
 Thumbs.db
+
+# 早期 28BYJ-48 步进版残留目录（已弃用，仅本地构建/编辑器缓存，不入库）
+stm32_uln2003_28byj48_demo/

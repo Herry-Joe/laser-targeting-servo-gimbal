@@ -1,7 +1,7 @@
 # 舵机二维云台改造方案（带滑环）
 
 > 原方案：双轴 ULN2003 + 28BYJ-48 步进电机（Pan 水平 + Tilt 俯仰），K230 视觉闭环激光打靶。
-> 新方案：双轴 270° 标准舵机 + 空心滑环，STM32F103C8T6 用 TIM1 输出 50Hz PWM 驱动（PA8=Pan/CH1，PA11=Tilt/CH4）。
+> 新方案：双轴 270° 标准舵机 + 空心滑环，STM32F103C8T6 用 50Hz PWM 驱动（**PB1=TIM3_CH4=Pan**，**PA11=TIM1_CH4=Tilt**）。
 > 固件已编译通过，产物 `servo_gimbal.hex`（Flash 77.2% / RAM 22.9%）。
 
 ---
@@ -33,11 +33,12 @@
 | 信号 | 原（步进） | 现（舵机） | 备注 |
 |---|---|---|---|
 | PA4 / PA5 | Pan IN1 / IN2 | 释放 | 悬空 |
-| **PA8** | （原未用） | **TIM1_CH1 → Pan 舵机 PWM** | 复用推挽 |
+| **PB1** | （原未用） | **TIM3_CH4 → Pan 舵机 PWM** | 复用推挽 |
 | **PA11** | （原未用） | **TIM1_CH4 → Tilt 舵机 PWM** | 复用推挽 |
 | PB3~PB6 | Tilt IN1~IN4 | 释放 | PB3/PB4 已 NOJTAG 释放 |
 | TIM2 | Pan 步进节拍 | Pan 步进节拍（不变） | Update 中断推进 pos_steps |
-| **TIM1** | （原未用） | **50Hz PWM 输出（舵机，PA8/PA11）** | 仅 PWM，无节拍中断 |
+| **TIM3** | （原未用） | **50Hz PWM（Pan，PB1=TIM3_CH4）** | 仅 PWM，无节拍中断 |
+| **TIM1** | （原未用） | **50Hz PWM（Tilt，PA11=TIM1_CH4）** | 仅 PWM，无节拍中断 |
 | **TIM4** | 未用 | **Tilt 步进节拍（新增）** | Update 中断推进 pos_steps |
 
 > 关键设计：保留原"虚拟步进"模型（pos_steps，单位 0.1°）和全部已调好的 PID / 位置闭环算法，
@@ -83,8 +84,8 @@
   pulse_us = 1500 + (pos_steps / 10.0) * 7.4074      // 7.4074 = 2000us / 270°
   钳位到 [500, 2500] us
   ```
-- **物理限位保护**：±135°（±1350 步），ISR 内钳位，防止舵机超程打坏齿轮。
-- **位置闭环限位**（可调）：Pan ±1350 步（±135°），Tilt ±400 步（±40°）。
+- **物理限位保护**：Pan ±135°（±1350 步）/ Tilt ±80°（±800 步），ISR 内钳位，防止舵机超程打坏齿轮。
+- **位置闭环软限位**（可调）：Pan ±400 步（±40°），Tilt ±300 步（±30°）。
 - 节拍周期 `step_delay_us` 决定舵机指令刷新率：1ms/步≈100°/s，20ms/步≈5°/s。
 
 ---
@@ -102,7 +103,7 @@
 - `src/main.c`
   - GPIO 释放 PA4~PA7、PB0~PB7 线圈配置；`TIM1_Init()` 改为 50Hz PWM（PA8/PA11 复用推挽）。
   - 新增 `TIM4_Init()`（Tilt 节拍）；TIM1 仅作 PWM（无 Update 中断），TIM4 作 Tilt 节拍。
-  - `Stepper_Init` 调用改为 `(&htim2,&htim1,CH1,"Pan")` / `(&htim4,&htim1,CH4,"Tilt")`。
+  - `Stepper_Init` 调用改为 `(&htim2,&htim3,CH4,"Pan")` / `(&htim4,&htim1,CH4,"Tilt")`。
   - 角度换算 `PosCtrl_AngleToSteps/StepsToAngle` 改用 3600 步/圈；K230 状态帧回传真实位置。
   - 限位 `POS_LIMIT_PAN ±1350`、回程差默认 0、丢步阈值 3000 步。
 
@@ -112,7 +113,7 @@
 
 ```bash
 # 编译（按本机 workbuddy 环境约定加 PYTHONPATH=""）
-cd stm32_uln2003_28byj48_demo
+cd stm32_servo_gimbal
 PYTHONPATH="" pio run
 
 # 生成 HEX（objcopy 不能写中文路径，先输出到英文临时路径再拷回）
