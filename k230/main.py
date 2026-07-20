@@ -10,7 +10,8 @@
 #     2. cv2.resize 缩到 320x240 (RVV 加速) 再跑检测 -> 计算量降到 1/6.25
 #     3. 靶心: cv2 灰度+高斯+自适应阈值 -> findContours 取最大轮廓
 #        优先 4 边形中心(方框靶), 否则用轮廓矩中心(同心圆靶)
-#     4. 激光: cv2 RGB->LAB -> inRange 红色掩膜 -> findContours 取最大轮廓
+#     4. 激光: 优先 cv2 HSV inRange(小图); 兜底 CanMV 原生 img.find_blobs() LAB(原图, 已验证可用)
+#        坐标从显示空间转到检测空间; find_blobs 是旧版已验证能识别激光的唯一可靠路径
 #     5. 检测坐标放大回 800x480 显示空间发包, 固件 HIT 容差(15px)语义不变
 #   实测帧率预期 30fps 级别 (旧版 1~2fps)。
 #
@@ -48,11 +49,13 @@ SCALE_X = SENSOR_W / DETECT_W
 SCALE_Y = SENSOR_H / DETECT_H
 
 # ========================= 激光 LAB 阈值 =========================
-# 用户实测激光 LAB: L=59~71, A=48~70, B=6~25 (检测空间下仍适用, 颜色与尺度无关)
-RED_L_MIN, RED_L_MAX = 59, 71
-RED_A_MIN, RED_A_MAX = 48, 70
-RED_B_MIN, RED_B_MAX = 6, 25
-RED_L_MIN_W, RED_L_MAX_W = 45, 75
+# 用户实测激光 LAB(当前 320x240 缩图画面实测): L:56~100, A:39~61, B:2~18
+# 主路径用这组值做 inRange; 同时试 RGB2LAB/BGR2LAB 取并集以适配 to_numpy_ref 通道顺序。
+RED_L_MIN, RED_L_MAX = 56, 100
+RED_A_MIN, RED_A_MAX = 39, 61
+RED_B_MIN, RED_B_MAX = 2, 18
+# 宽兜底(备用, 一般不再需要)
+RED_L_MIN_W, RED_L_MAX_W = 45, 110
 RED_A_MIN_W, RED_A_MAX_W = 0, 75
 RED_B_MIN_W, RED_B_MAX_W = -45, 40
 # 检测空间像素阈值 (320x240 下激光面积约 800x480 的 1/6.25)
@@ -127,40 +130,76 @@ def detect_target_cv2(small):
         print("tgt_cv err:", e)
     return None
 
-def detect_laser_cv2(small, prev, locked):
-    """small: RGB888 ndarray -> (cx, cy, ok) detect space。"""
+# 诊断: 激光像素数 (OSD/串口调试用)
+g_laser_px = 0
+
+def detect_laser(img, prev_x, prev_y, locked):
+    """激光检测: 优先 cv2 HSV inRange(小图); 兜底 img.find_blobs()(原图, 已验证可用)。
+    img: CanMV image 对象 (用于 find_blobs 兜底)
+    返回 (cx_detect, cy_detect, ok) detect space 坐标。
+    """
+    global g_laser_px
+    # ---- 路径 A: cv2 HSV inRange (在缩小图上跑, 快) ----
+    if HAVE_CV2:
+        try:
+            arr = img.to_numpy_ref()
+            small = cv2.resize(arr, (DETECT_W, DETECT_H))
+            # 尝试 HSV (比 LAB 更通用, K230 cv2 更可能支持)
+            hsv_ok = False
+            for cname in ("COLOR_RGB2HSV", "COLOR_BGR2HSV"):
+                try:
+                    code = getattr(cv2, cname)
+                    hsv = cv2.resize(small, (DETECT_W, DETECT_H))  # already small, no-op-ish
+                    hsv = cv2.cvtColor(small, code)
+                    # 红色在 HSV 中是 H≈0~10 或 H≈170~180, 高饱和度高亮度
+                    lower1 = (0, 100, 100)
+                    upper1 = (15, 255, 255)
+                    lower2 = (160, 100, 100)
+                    upper2 = (180, 255, 255)
+                    m1 = cv2.inRange(hsv, lower1, upper1)
+                    m2 = cv2.inRange(hsv, lower2, upper2)
+                    mask = m1 | m2
+                    contours = _contours_of(cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE))
+                    if contours:
+                        best = max(contours, key=cv2.contourArea)
+                        area = cv2.contourArea(best)
+                        if area >= LASER_MIN_PX:
+                            g_laser_px = int(area)
+                            M = cv2.moments(best)
+                            if M['m00'] != 0:
+                                return M['m10']/M['m00'], M['m01']/M['m00'], True
+                    hsv_ok = True
+                    break
+                except Exception:
+                    continue
+            if not hsv_ok:
+                print("[LASER] cv2 无 HSV 支持, 用 find_blobs")
+        except Exception as e:
+            print("[LASER] cv2 检测失败:", e)
+
+    # ---- 路径 B: CanMV 原生 find_blobs (兜底, 在原图上, 已验证可用) ----
     try:
-        lab = cv2.cvtColor(small, cv2.COLOR_RGB2LAB)
-        mask = cv2.inRange(lab,
-            (RED_L_MIN, RED_A_MIN, RED_B_MIN),
-            (RED_L_MAX, RED_A_MAX, RED_B_MAX))
-        contours = _contours_of(cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE))
-        if not contours:
-            # 兜底宽阈值
-            mask = cv2.inRange(lab,
-                (RED_L_MIN_W, RED_A_MIN_W, RED_B_MIN_W),
-                (RED_L_MAX_W, RED_A_MAX_W, RED_B_MAX_W))
-            contours = _contours_of(cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE))
-        if not contours:
-            return -1, -1, False
-        cands = []
-        for c in contours:
-            a = cv2.contourArea(c)
-            if a < LASER_MIN_PX or a > LASER_WASHOUT_PX:
-                continue
-            M = cv2.moments(c)
-            if M['m00'] == 0:
-                continue
-            cands.append((M['m10'] / M['m00'], M['m01'] / M['m00'], a))
-        if not cands:
-            return -1, -1, False
-        if locked and prev[0] >= 0:
-            best = min(cands, key=lambda t: (t[0]-prev[0])**2 + (t[1]-prev[1])**2)
-        else:
-            best = max(cands, key=lambda t: t[2])
-        return best[0], best[1], True
+        blobs = img.find_blobs([
+            (RED_L_MIN, RED_L_MAX, RED_A_MIN, RED_A_MAX, RED_B_MIN, RED_B_MAX),
+        ], False, x_stride=2, y_stride=2,
+           pixels_threshold=LASER_MIN_PX*6, merge=True, margin=True)
+        if not blobs:
+            # 宽阈值兜底
+            blobs = img.find_blobs([
+                (RED_L_MIN_W, RED_L_MAX_W, RED_A_MIN_W, RED_A_MAX_W, RED_B_MIN_W, RED_B_MAX_W),
+            ], False, x_stride=2, y_stride=2,
+               pixels_threshold=LASER_MIN_PX*6, merge=True, margin=True)
+        if blobs:
+            b = max(blobs, key=lambda b: b.pixels())
+            g_laser_px = b.pixels()
+            # find_blobs 返回显示空间坐标 → 转到检测空间
+            dx = float(b.cx()) / SCALE_X
+            dy = float(b.cy()) / SCALE_Y
+            return dx, dy, True
     except Exception as e:
-        print("las_cv err:", e)
+        print("[LASER] find_blobs err:", e)
+
+    g_laser_px = 0
     return -1, -1, False
 
 # ======================= 回退检测 (无 cv2) =======================
@@ -185,14 +224,6 @@ def detect_target_legacy(img):
         return (x + w // 2, y + h // 2)
     except Exception:
         return None
-
-def detect_laser_legacy(img, prev_x, prev_y, locked):
-    blobs = img.find_blobs([(RED_L_MIN, RED_L_MAX, RED_A_MIN, RED_A_MAX, RED_B_MIN, RED_B_MAX)],
-                           False, x_stride=2, y_stride=2, pixels_threshold=LASER_MIN_PX*6, merge=True, margin=True)
-    if not blobs:
-        return -1, -1, False
-    b = max(blobs, key=lambda b: b.pixels())
-    return b.cx(), b.cy(), True
 
 # ======================== 串口 ========================
 def crc8(data):
@@ -311,16 +342,16 @@ def run():
                 time.sleep_ms(30)
                 continue
 
-            # ============== 检测 (cv2 小图 / 回退原图) ==============
+            # ============== 检测 (cv2 小图靶心 / find_blobs激光) ==============
             if HAVE_CV2:
                 arr = img.to_numpy_ref()              # 零拷贝 RGB888 ndarray
                 small = cv2.resize(arr, (DETECT_W, DETECT_H))   # RVV 加速
                 t_raw = detect_target_cv2(small)
-                lx_d, ly_d, l_raw = detect_laser_cv2(small,
-                    (lx_s, ly_s) if l_lock else (-1, -1), l_lock)
+                lx_d, ly_d, l_raw = detect_laser(img,
+                    lx_s if l_lock else -1, ly_s if l_lock else -1, l_lock)
             else:
                 t_raw = detect_target_legacy(img)
-                lx_d, ly_d, l_raw = detect_laser_legacy(img,
+                lx_d, ly_d, l_raw = detect_laser(img,
                     lx_s if l_lock else -1, ly_s if l_lock else -1, l_lock)
 
             # ============== 激光时序 (detect space) ==============
@@ -355,7 +386,7 @@ def run():
             ly = ly_s if l_det else -1
 
             if fc % 30 == 0:
-                print("[LASER] det=%d lock=%d pos=(%.0f,%.0f)" % (l_raw, l_lock, lx, ly))
+                print("[LASER] raw=%d lock=%d px=%d pos=(%.0f,%.0f)" % (l_raw, l_lock, g_laser_px, lx, ly))
 
             # ============== 靶心时序 (detect space) ==============
             if t_raw:
