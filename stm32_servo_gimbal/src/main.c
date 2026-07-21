@@ -845,30 +845,6 @@ void TIM3_Init(void)
     /* TIM3 仅作 Pan PWM 输出 */
 }
 
-/* ========================== 舵机 PWM 自检 (诊断用) ==========================
- * 上电后让舵机在两个极限位置来回扫 3 次, 直接写 CCR 寄存器, 不经过状态机/中断.
- * 如果舵机动了 → PWM 硬件和连接 OK; 不动 → 查供电或接线.
- * ================================================================= */
-static void Servo_DiagTest(void)
-{
-    printf("\r\n[诊断] 舵机 PWM 自检 (3 次扫角)...\r\n");
-    for (int i = 0; i < 3; i++) {
-        /* 最大角度位置 */
-        __HAL_TIM_SET_COMPARE(&htim3, SERVO_PAN_CHANNEL,  PAN_PULSE_MAX_US);
-        __HAL_TIM_SET_COMPARE(&htim1, SERVO_TILT_CHANNEL, TILT_PULSE_MAX_US);
-        HAL_Delay(400);
-        /* 零度位置 */
-        __HAL_TIM_SET_COMPARE(&htim3, SERVO_PAN_CHANNEL,  PAN_PULSE_MIN_US);
-        __HAL_TIM_SET_COMPARE(&htim1, SERVO_TILT_CHANNEL, TILT_PULSE_MIN_US);
-        HAL_Delay(400);
-    }
-    /* 回中位 */
-    __HAL_TIM_SET_COMPARE(&htim3, SERVO_PAN_CHANNEL,  PAN_CENTER_US);
-    __HAL_TIM_SET_COMPARE(&htim1, SERVO_TILT_CHANNEL, TILT_CENTER_US);
-    printf("[诊断] 舵机自检完成, 已回中位\r\n");
-    HAL_Delay(200);
-}
-
 /* ========================== TIM4 初始化 (Tilt 电机步进节拍) ========================== */
 
 void TIM4_Init(void)
@@ -2668,9 +2644,9 @@ int main(void)
                   "Tilt");
     IWDG_FEED();
 
-    /* 舵机 PWM 自检 (仅诊断用, 不影响后续控制) */
-    Servo_DiagTest();
-    IWDG_FEED();
+    /* 舵机自检已取消 (上电直接回中位, 省去 3 次扫角) */
+    __HAL_TIM_SET_COMPARE(&htim3, SERVO_PAN_CHANNEL,  PAN_CENTER_US);
+    __HAL_TIM_SET_COMPARE(&htim1, SERVO_TILT_CHANNEL, TILT_CENTER_US);
 
     /* v4.10: 初始化两个 PID 控制器 (设置基础增益/段增益/微分滤波/退饱和等所有参数) */
     K230_PID_Init(&g_pid_pan,  PAN_GAIN, PAN_DEC_ZONE,  CTRL_KD, (float)PID_DEADZONE);
