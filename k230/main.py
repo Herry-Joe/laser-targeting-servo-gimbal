@@ -220,6 +220,19 @@ LASER_GLOBAL_SWEEP_INTERVAL = 2   # 全局兜底扫描间隔帧 [v5.2: 保留常
 LASER_RECOVER_ENABLE     = True
 LASER_RECOVER_GIVEUP_MS  = 6000   # [v5.2: 4000→6000]
 
+# ----- 激光丢失自动寻回 (v5.13) -----
+# 丢失后不再"被动 HOLD 等待"(舵机冻结, 激光不会自己回来), 而是围绕 last_good
+# 在 ±LASER_SEARCH_RADIUS_PX 内做有界之字形扫描, 主动把激光扫回相机视野 → 重锁.
+# 关键: 扫描范围有界 + 总超时放弃 → 舵机绝不会"越偏越远"(根治漂移积累).
+# 关闭 LASER_SEARCH_ENABLE 时回退到旧版被动 HOLD 恢复.
+LASER_SEARCH_ENABLE      = True
+LASER_SEARCH_RADIUS_PX   = 80     # 扫描半幅 (proc px, 以 last_good 为中心)
+LASER_SEARCH_ROWS        = 3      # 之字形行数 (含中心行, >=2)
+LASER_SEARCH_STEP_FRAMES = 12     # 每个航点停留帧数 (~0.4s@30fps, 给舵机走到位)
+LASER_SEARCH_TIMEOUT_MS  = 8000   # 寻回总超时 (超过则放弃 → valid=0 安全停车)
+# 丢失瞬间是否继续用速度外推参考点: False=冻结参考(不追鬼影, 防舵机累积漂移)
+LASER_PREDICT_ON_LOSS    = False
+
 # ----- 输出协议 -----
 # "binary" = 与 STM32 firmware 匹配 (默认)
 # "ascii"  = "$cx,cy#" (TI 风格电机追点)
@@ -491,7 +504,7 @@ def crc8(data):
     return crc & 0xFF
 
 
-def send_binary(uart, x, y, valid, hit, hi_conf, boot=False, hold=False, corner=False):
+def send_binary(uart, x, y, valid, hit, hi_conf, boot=False, hold=False, corner=False, search=False):
     """坐标帧: 0x3C 0x3B [XH][XL][YH][YL][FLAG][CRC8] 0x01 0x01 (10字节)
     [v5.2] FLAG 扩展: bit3=BOOT(开机回中), bit4=HOLD(激光丢失保持速度)
     [v5.7] bit5=NEAR_CORNER(接近矩形拐角, 请求 STM32 减速防过冲)"""
@@ -513,6 +526,7 @@ def send_binary(uart, x, y, valid, hit, hi_conf, boot=False, hold=False, corner=
     if boot:  f |= 8      # bit3 = BOOT  [v5.2 新增]
     if hold:  f |= 16     # bit4 = HOLD  [v5.2 新增]
     if corner: f |= 32    # bit5 = NEAR_CORNER [v5.7 新增]
+    if search: f |= 64    # bit6 = SEARCH [v5.13 新增, 自动寻回中]
     buf[6] = f
     buf[7] = crc8(bytes([buf[2], buf[3], buf[4], buf[5], buf[6]]))
     buf[8] = 1
@@ -572,7 +586,7 @@ def parse_host_command(uart):
 
 
 def send_trace(uart, desired_frame, laser_frame, valid, done,
-               hold=False, boot=False, corner=False):
+               hold=False, boot=False, corner=False, search=False):
     """把当前循迹设定点发给云台.
     binary 模式: err = desired - reference (laser 或 画面中心)
     ascii  模式: 发设定点绝对坐标 (供追点电机用)
@@ -595,7 +609,7 @@ def send_trace(uart, desired_frame, laser_frame, valid, done,
             ey = desired_frame[1] - FRAME_H // 2
     else:
         ex = ey = 0
-    return send_binary(uart, ex, ey, valid, done, valid, boot, hold, corner)
+    return send_binary(uart, ex, ey, valid, done, valid, boot, hold, corner, search)
 
 
 # ========================= 矩形几何 =========================
@@ -633,6 +647,45 @@ def fixed_outer_corners():
     x0 = int(round(PROC_W * m)); y0 = int(round(PROC_H * m))
     x1 = int(round(PROC_W * (1.0 - m))); y1 = int(round(PROC_H * (1.0 - m)))
     return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+
+
+class LaserSearch:
+    """[v5.13] 有界之字形(boustrophedon)扫描: 围绕 anchor 在 ±radius 内生成航点.
+    主动把激光扫回相机视野, 一旦 detect_laser 重新捕获即重锁退出.
+    有界(范围固定) + 可穷举(航点有限) → 舵机绝不会无限漂移."""
+    def __init__(self, anchor, radius, rows):
+        self.anchor = anchor
+        self.radius = radius
+        self.rows = max(2, int(rows))
+        ax, ay = anchor
+        self.waypoints = []
+        for r in range(self.rows):
+            fy = -1.0 + 2.0 * (r / (self.rows - 1)) if self.rows > 1 else 0.0
+            cy = ay + fy * radius
+            # 偶数行从左到右, 奇数行从右到左 → 之字形连续覆盖
+            xs = [-radius, radius] if (r % 2 == 0) else [radius, -radius]
+            for fx in xs:
+                wx = int(round(ax + fx))
+                wy = int(round(cy))
+                # 夹到画面内, 避免扫描目标跑到视野外导致舵机越界
+                wx = max(0, min(PROC_W - 1, wx))
+                wy = max(0, min(PROC_H - 1, wy))
+                self.waypoints.append((wx, wy))
+        self.idx = 0
+        self.done = False
+
+    def current(self):
+        if self.idx >= len(self.waypoints):
+            return self.waypoints[-1]
+        return self.waypoints[self.idx]
+
+    def advance(self):
+        self.idx += 1
+        if self.idx >= len(self.waypoints):
+            self.done = True
+
+    def __len__(self):
+        return len(self.waypoints)
 
 
 def choose_snap_alpha(jump, ref_size):
@@ -1195,7 +1248,7 @@ def scale_rect_to_frame(rect):
 
 def draw_osd(canvas, corner_frame, center_frame, start_frame, desired_frame,
              laser_frame, inner_corner_frame, progress, done, fps_value,
-             recovering, task_mode, boot_state=None):
+             recovering, task_mode, boot_state=None, searching=False, search_obj=None):
     """画 OSD: 矩形 (绿) + 矩形中心原点 (黄) + 内框 (浅绿) + 激光 (红)
               + 设定点 (蓝) + 任务状态文字.
     [v5.2] boot_state: None / "RECENTERING" / "DONE" / "FAIL"
@@ -1266,6 +1319,14 @@ def draw_osd(canvas, corner_frame, center_frame, start_frame, desired_frame,
     if recovering:
         canvas.draw_string_advanced(450, 39, 24, "RECOVER", color=amber)
         canvas.draw_circle(FRAME_W // 2, FRAME_H // 2, 40, amber, 3)
+
+    if searching:
+        canvas.draw_string_advanced(420, 39, 24, "SEARCH", color=blue)
+        # 扫描航点提示框(蓝色方框), 让现场看清舵机正在主动扫回
+        if search_obj is not None:
+            wp = search_obj.current()
+            wpf = scale_point_to_frame(wp)
+            canvas.draw_circle(wpf[0], wpf[1], 10, blue, 2)
 
     # [v5.2] BOOT 状态显示 (顶部, 居中)
     if boot_state == "RECENTERING":
@@ -1507,6 +1568,13 @@ def main():
     recover_start_ms = 0
     last_good_laser_proc = None
 
+    # [v5.13] 激光丢失自动寻回 (有界扫描)
+    searching = False
+    search_obj = None
+    search_start_ms = 0
+    search_step_count = 0
+    search_exhausted = False   # 扫描穷举/超时 → 发 valid=0 安全停车
+
     # 激光帧间预测
     l_vx = 0.0
     l_vy = 0.0
@@ -1525,7 +1593,7 @@ def main():
         camera_init()
         camera_is_init = True
         write_status("camera_ok", "camera initialized")
-        print("=== ti_cup_e_rect_trace v5.10 (四线段外框+内框优化) start ===")
+        print("=== ti_cup_e_rect_trace v5.13 (激光丢失自动寻回+防漂移) start ===")
         print("cv2 available:", HAS_CV2)
 
         while True:
@@ -1614,13 +1682,28 @@ def main():
                 else:
                     do_global = False
                     l_global_cd -= 1
+                if searching and search_obj is not None:
+                    # [v5.13] 寻回期间: ROI/门限跟随当前扫描航点, 全局兜底扫描,
+                    #   让被舵机扫到视野内的激光立即被捕获; 远处反射仍被门限拒识
+                    _wp = search_obj.current()
+                    _det_prev_x, _det_prev_y = _wp[0], _wp[1]
+                    _det_pred_x, _det_pred_y = _wp[0], _wp[1]
+                    _det_roi_expand = 3.0
+                    _det_do_global = True
+                    _det_last_good = _wp
+                else:
+                    _det_prev_x = lx_s if l_lock else -1
+                    _det_prev_y = ly_s if l_lock else -1
+                    _det_pred_x, _det_pred_y = px_pred, py_pred
+                    _det_roi_expand = roi_expand
+                    _det_do_global = do_global
+                    _det_last_good = last_good_laser_proc
                 lx, ly, laser_det = detect_laser(
                     rgb,
-                    lx_s if l_lock else -1,
-                    ly_s if l_lock else -1,
-                    px_pred, py_pred, l_lock, pred_ok,
-                    roi_expand, do_global,
-                    last_good=last_good_laser_proc,
+                    _det_prev_x, _det_prev_y,
+                    _det_pred_x, _det_pred_y, l_lock, pred_ok,
+                    _det_roi_expand, _det_do_global,
+                    last_good=_det_last_good,
                 )
                 if laser_det:
                     if l_lock:
@@ -1661,21 +1744,39 @@ def main():
                             smooth_init = False
                             print("laser: re-acquired, re-synced arc={:.1f}".format(traj_arc))
                         recovering = False
+                        searching = False
+                        search_obj = None
+                        search_exhausted = False
                         last_good_laser_proc = None
                 else:
                     l_miss_cnt = min(l_miss_cnt + 1, 32)
                     l_hit_cnt = 0
                     l_prev_miss = True
                     if l_lock:
-                        # 短暂丢失: 用预测速度外推, 控制参考连续
-                        lx_s = int(clamp(lx_s + l_vx * dt * LASER_PREDICT_GAIN, 0, PROC_W - 1))
-                        ly_s = int(clamp(ly_s + l_vy * dt * LASER_PREDICT_GAIN, 0, PROC_H - 1))
+                        if LASER_PREDICT_ON_LOSS:
+                            # 短暂丢失: 用预测速度外推, 控制参考连续
+                            lx_s = int(clamp(lx_s + l_vx * dt * LASER_PREDICT_GAIN, 0, PROC_W - 1))
+                            ly_s = int(clamp(ly_s + l_vy * dt * LASER_PREDICT_GAIN, 0, PROC_H - 1))
+                        # else: 冻结参考点(不追鬼影), 防止舵机在丢失窗口累积漂移
                     if l_lock and l_miss_cnt >= LASER_LOST_FRAMES:
                         l_lock = False
-                        if LASER_RECOVER_ENABLE and traj_locked:
+                        if last_good_laser_proc is None:
+                            last_good_laser_proc = (lx_s, ly_s)
+                        # [v5.13] 优先: 有界自动寻回 — 主动把激光扫回视野, 根治漂移
+                        if LASER_SEARCH_ENABLE:
+                            searching = True
+                            search_obj = LaserSearch(last_good_laser_proc,
+                                                     LASER_SEARCH_RADIUS_PX,
+                                                     LASER_SEARCH_ROWS)
+                            search_start_ms = time.ticks_ms()
+                            search_step_count = 0
+                            search_exhausted = False
+                            recovering = False
+                            print("laser: LOST -> SEARCH (bounded auto-reacquire, {} waypoints)".format(
+                                len(search_obj)))
+                        elif LASER_RECOVER_ENABLE and traj_locked:
                             recovering = True
                             recover_start_ms = time.ticks_ms()
-                            last_good_laser_proc = (lx_s, ly_s)
                             # [v5.10] 不再反转方向! 反转会导致设定点远离激光位置,
                             #   重捕后误差反而更大 → 更容易再次LOST(死循环).
                             #   改为保持设定点不动, 等激光回来后重同步到最近点.
@@ -1814,7 +1915,11 @@ def main():
             desired_frame = None
             progress = 0.0
             near_corner = False   # [v5.7] 接近拐角标志, 每帧重置, 仅在循迹分支内置位
-            if task_mode == TASK_BOOT:
+            if searching and search_obj is not None:
+                # [v5.13] 自动寻回: 设定点=当前扫描航点, 主动驱动舵机把激光扫回视野
+                _wp = search_obj.current()
+                desired_frame = scale_point_to_frame(_wp)
+            elif task_mode == TASK_BOOT:
                 # [v5.2] BOOT 自动回中: 设定点 = 矩形中心 (类似 RECENTER)
                 # |err_x|<8 且 |err_y|<8 持续 500ms → 切 TASK_IDLE + boot_done=True
                 # 5 秒未锁定 → 每 2 秒重试 (清 traj_locked 让下次重新检测)
@@ -2017,6 +2122,23 @@ def main():
                 # TASK_IDLE: 无设定点
                 desired_frame = None
 
+            # ---- [v5.13] 自动寻回扫描推进 / 超时 / 穷举放弃 ----
+            if searching and search_obj is not None:
+                search_step_count += 1
+                if search_step_count >= LASER_SEARCH_STEP_FRAMES:
+                    search_step_count = 0
+                    search_obj.advance()
+                    if search_obj.done:
+                        searching = False
+                        search_exhausted = True
+                        last_good_laser_proc = None
+                        print("laser: SEARCH exhausted (all waypoints) -> give up (safe-stop)")
+                if time.ticks_diff(time.ticks_ms(), search_start_ms) > LASER_SEARCH_TIMEOUT_MS:
+                    searching = False
+                    search_exhausted = True
+                    last_good_laser_proc = None
+                    print("laser: SEARCH timeout -> give up (safe-stop)")
+
             # ---- 激光丢失回退超时 ----
             if recovering and LASER_RECOVER_ENABLE:
                 if time.ticks_diff(time.ticks_ms(), recover_start_ms) > LASER_RECOVER_GIVEUP_MS:
@@ -2028,8 +2150,15 @@ def main():
             # [v5.2] HOLD: 激光丢失时 desired_point 保持, 用外推的 lx_s/ly_s 作参考,
             #        valid=True + FLAG bit4=1, STM32 收到后维持速度 500ms 再停车 (不要 err=0)
             hold_out = False
+            search_out = False
             if desired_frame is not None:
-                if TRACE_REFERENCE == "laser":
+                if searching and search_obj is not None and last_good_laser_proc is not None:
+                    # [v5.13] 自动寻回: 主动驱动舵机扫向航点, 参考点=last_good(冻结)
+                    #   既非 HOLD 也非冻结: STM32 正常闭环走到航点, 激光被扫回视野即重锁
+                    laser_frame = scale_point_to_frame(last_good_laser_proc)
+                    valid_out = True
+                    search_out = True
+                elif TRACE_REFERENCE == "laser":
                     if l_lock:
                         laser_frame = scale_point_to_frame((lx_s, ly_s))
                         valid_out = True
@@ -2052,7 +2181,11 @@ def main():
                 #   现改为: 激光锁定(l_lock)即 valid_out=True, 并给一个设定点驱动云台:
                 #     - 矩形已锁定 -> 设定点=矩形中心(自动 RECENTER, 把激光对到靶板中心)
                 #     - 矩形未锁定 -> 设定点=画面中心(先把激光保持在视野中心, 给即时响应)
-                if l_lock:
+                if search_exhausted:
+                    # [v5.13] 寻回穷举/超时 → 发 valid=0 让 STM32 安全停车(不再回退到 HOLD)
+                    laser_frame = None
+                    valid_out = False
+                elif l_lock:
                     if traj_locked and traj_center_frame is not None:
                         desired_frame = traj_center_frame
                     else:
@@ -2073,7 +2206,8 @@ def main():
                 # [v5.2] 传入 hold/boot FLAG 位 (l_lock=0 时 HOLD, task_mode=BOOT 时 BOOT)
                 # [v5.7] 传入 corner(NEAR_CORNER) 标志 → STM32 接近拐角减速
                 send_trace(uart, desired_frame, laser_frame, valid_out, traj_done,
-                           hold=hold_out, boot=boot_out, corner=near_corner)
+                           hold=hold_out, boot=boot_out, corner=near_corner,
+                           search=search_out)
 
             # ---- Debug 打印 ----
             if DEBUG_PRINT_INTERVAL and frame_id % DEBUG_PRINT_INTERVAL == 0:
@@ -2110,7 +2244,8 @@ def main():
                 draw_osd(osd_img, traj_corner_frame, traj_center_frame,
                          traj_start_frame, desired_frame, laser_frame,
                          traj_inner_corner_frame, progress, traj_done,
-                         clock.fps(), recovering, task_mode, boot_state)
+                         clock.fps(), recovering, task_mode, boot_state,
+                         searching, search_obj)
                 Display.show_image(osd_img, layer=Display.LAYER_OSD1)
 
             if frame_id == STATUS_RUNNING_FRAME:
