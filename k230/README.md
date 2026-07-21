@@ -9,7 +9,7 @@
 
 | 文件 | 说明 |
 |------|------|
-| `main.py` | **当前版本 v5.7（自包含，单文件）**：cv2 矩形角点检测 + LAB 激光检测 + 矩形周长循迹（RECENTER / TRACE_BORDER / TRACE_INNER），三通道传感器（YUV 显示 + 灰度矩形 + RGB565 激光）。**不依赖任何本地模块，部署只需拷这一个文件。** |
+| `main.py` | **当前版本 v5.8（自包含，单文件）**：cv2 矩形角点检测 + LAB 激光检测 + 矩形周长循迹（RECENTER / TRACE_BORDER / TRACE_INNER），三通道传感器（YUV 显示 + 灰度矩形 + RGB565 激光）。**不依赖任何本地模块，部署只需拷这一个文件。** |
 | `rect_detector.py` | **已弃用 / 历史**：早期"基础要求"矩形检测模块（cv2.minAreaRect 旋转框）。v5.2 已内联矩形检测逻辑，不再 import 本文件。保留作参考。 |
 | `backup/main_rect_legacy.py` | 历史版本：rect_detector 集成版 main.py（会 `from rect_detector import ...`，缺模块即 `ImportError`）|
 | `backup/main_yolo_backup.py` | 历史版本：YOLO 检测靶心（已弃用，仅作参考）|
@@ -123,4 +123,9 @@ K230 REPL 会周期打印（约每 30 帧）：
   - **K230 解析 STM32 命令帧**：新增 `parse_host_command()`，识别 `0x3C 0x3C [CMD]`，响应 `TRACE_BORDER/TRACE_INNER/RECENTER/STOP/AIM`（PA1/PA0 按键驱动）。
   - **接近拐角减速**：循迹 setpoint 走到四个角附近（`d_corner < CORNER_SLOWDOWN_ARC`）时置 **FLAG bit5 = NEAR_CORNER**，通知 STM32 降速防过冲；直线段保持原速（提速）。
   - 通信坐标帧仍 `0x3C 0x3B ...`，FLAG 新增 bit5。
+
+- **v5.8（循迹精度提升）**
+  - **激光按圆形色块建模**：坐标取外接框几何中心（`_blob_geom_center`），替代原质心 `cx()/cy()`，对不对称光晕/卫星像素更鲁棒。
+  - **检测门限拒反射误检**：`detect_laser` 非锁定分支（初始捕获 / 恢复中）若已有上次良好位置，要求候选在其 `LASER_TRACK_MAX_D` 内，否则判丢失——避免把远处反射/杂光当激光驱动云台冲飞（实测曾出现 700px 级假误差尖峰）。
+  - 启动打印版本号同步为 v5.8。
 

@@ -370,6 +370,10 @@ static void K230_PID_Init(K230_PID *pid,
 #define TRACE_SPEED      0.60f   /* 循迹直线段目标速度(地板): 提速率, 保证画直线流畅 */
 #define CORNER_FACTOR    0.35f   /* 接近矩形拐角降速系数: 强减速防过冲冲出角外 */
 #define VEL_STOP_BAND    0.015f  /* 定点锁靶停止带: 速度指令低于此值直接停机, 消除靶心附近微抖/摇摆 */
+/* [v5.8] 误差相关地板: 远线(|err|>TRACE_FLOOR_ERR_PX)用 TRACE_SPEED 跟线速度地板,
+ *   近线降到 TRACE_NEAR_FLOOR, 允许误差归零, 消除恒定地板导致的极限环(抖动/偏移) */
+#define TRACE_FLOOR_ERR_PX  25
+#define TRACE_NEAR_FLOOR    0.06f
 
 /* ---- Tilt 垂直轴专用限制 (防"激光打到天上") ---- */
 /*   STEPPER_HALF_REV=4096 步 = 360°, 故 1 步 ≈ 0.088° */
@@ -1718,9 +1722,14 @@ static void K230_ControlAxis(StepperMotor *motor, K230_PID *pid,
         /* [v5.7] 矩形循迹速度整形:
          *  - 直线段: 速度地板 = TRACE_SPEED, 提升跟随速度(画直线提速, 保证流畅)
          *  - 接近拐角(K230 置 bit5): 地板降为 TRACE_SPEED*CORNER_FACTOR, 强减速防过冲
-         *  地板保留 dir_out 符号; err≈0 时沿用 EMA 历史方向, 避免强制单向漂移 */
+         *  [v5.8] 误差相关地板: |err|<TRACE_FLOOR_ERR_PX 时地板降为 TRACE_NEAR_FLOOR,
+         *   允许误差归零, 消除恒定 0.60 地板在误差→0 时仍强推导致的极限环(抖动/偏移).
+         *  地板保留符号; err≈0 时沿用 EMA 历史方向, 避免强制单向漂移 */
         if (tracing) {
             float tspeed = g_k230_corner ? (TRACE_SPEED * CORNER_FACTOR) : TRACE_SPEED;
+            if (abs(err) < TRACE_FLOOR_ERR_PX) {
+                tspeed = TRACE_NEAR_FLOOR;   /* 近线极小地板: 误差可归零, 激光贴线不抖 */
+            }
             float sc_mag = (signed_cmd >= 0.0f) ? signed_cmd : -signed_cmd;
             if (sc_mag < tspeed) {
                 float sgn = (signed_cmd > 0.0f) ? 1.0f

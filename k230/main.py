@@ -916,7 +916,8 @@ def _nearest_in_window(cands, ref_x, ref_y, max_d):
 
 
 def detect_laser(laser_img, prev_x, prev_y, pred_x, pred_y,
-                 locked, pred_ok, roi_expand=1.0, do_global=False):
+                 locked, pred_ok, roi_expand=1.0, do_global=False,
+                 last_good=None):
     """[v5.2] LAB 红激光检测: 多级 LAB 阈值回退 (NARROW→CENTER→WIDE→HOT),
     锁定后 ROI 搜索失败立即全局兜底 (无帧冷却)."""
     if not laser_img:
@@ -977,8 +978,15 @@ def detect_laser(laser_img, prev_x, prev_y, pred_x, pred_y,
                 # 这级找到了但都不在窗口内 → 继续试下一级 (更宽泛)
             else:
                 best = max(cands, key=lambda t: t[3] / (1.0 + t[1] * 0.01))
-                gx, gy = _blob_geom_center(best[0])
-                return gx, gy, True
+                bx, by = _blob_geom_center(best[0])
+                # [v5.8] 非锁定(初始捕获/恢复中): 若已有上次良好位置, 要求候选在其
+                #   LASER_TRACK_MAX_D 内, 否则拒绝(远处反射/杂光当激光会驱动云台冲飞).
+                #   首次捕获(last_good=None)不门限, 正常选最圆 blob.
+                if last_good is not None:
+                    d = math.hypot(bx - last_good[0], by - last_good[1])
+                    if d > LASER_TRACK_MAX_D:
+                        return -1, -1, False
+                return bx, by, True
     return -1, -1, False
 
 
@@ -1333,7 +1341,7 @@ def main():
         camera_init()
         camera_is_init = True
         write_status("camera_ok", "camera initialized")
-        print("=== ti_cup_e_rect_trace v5.2 (cv2 + laser) start ===")
+        print("=== ti_cup_e_rect_trace v5.8 (cv2 + laser) start ===")
         print("cv2 available:", HAS_CV2)
 
         while True:
@@ -1425,6 +1433,7 @@ def main():
                     ly_s if l_lock else -1,
                     px_pred, py_pred, l_lock, pred_ok,
                     roi_expand, do_global,
+                    last_good=last_good_laser_proc,
                 )
                 if laser_det:
                     if l_lock:
