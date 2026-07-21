@@ -355,10 +355,10 @@ static void K230_PID_Init(K230_PID *pid,
  *
  *   v5.2 调整: Kp 从 1.0 降至 0.005, 让速度在 0~200px 范围内比例变化,
  *   而非"非全速即停", 配合更宽的减速区实现平滑逼近, 根治过冲振荡. */
-#define PAN_GAIN        0.006f  /* Pan 速度增益: 降增益抑过冲(约167px→全速), 仍跟手 */
-#define PAN_DEC_ZONE    120.0f  /* Pan 减速区(px): 加宽→更早减速, 根治过冲靶心 */
-#define TILT_GAIN       0.004f  /* Tilt 速度增益: 降低抑过冲 */
-#define TILT_DEC_ZONE   90.0f   /* Tilt 减速区(px): 加宽→更早减速, 垂直轴更柔 */
+#define PAN_GAIN        0.005f  /* [v5.10] Pan 速度增益: 原0.006→0.005 (200px→全速), 减少大误差过冲 */
+#define PAN_DEC_ZONE    140.0f  /* [v5.10] Pan 减速区: 原120→140 (更早减速, 根治RECENTER过冲) */
+#define TILT_GAIN       0.003f  /* [v5.10] Tilt 速度增益: 原0.004→0.003 (333px→全速), 抑制Y轴±50px振荡 */
+#define TILT_DEC_ZONE   110.0f  /* [v5.10] Tilt 减速区: 原90→110 (更柔) */
 #define CTRL_KD         0.0015f /* 接近阻尼: 加大抑制过冲(原 0.0005) */
 #define PID_ILIMIT      20.0f
 #define PID_DEADZONE    3       /* 死区 (像素) — Pan 轴 */
@@ -367,14 +367,14 @@ static void K230_PID_Init(K230_PID *pid,
                                     * [v5.8] 4→12: K230 误差噪声约 ±15px, 增大迟滞避免噪声触发反复反向(消 AIM 模式摇摆) */
 #define HIT_RELEASE_PX  40      /* 命中锁存后, 误差超此值(px)才重新捕获(远大于命中容差15px, 根治靶心附近抖停不停) */
 
-/* ---- [v5.7] 矩形循迹速度整形 ---- */
-#define TRACE_SPEED      0.60f   /* 循迹直线段目标速度(地板): 提速率, 保证画直线流畅 */
+/* ---- [v5.7/v5.10] 矩形循迹速度整形 ---- */
+#define TRACE_SPEED      0.45f   /* [v5.10] 循迹直线段目标速度(地板): 原0.60→0.45, 减少过冲和LOST */
 #define CORNER_FACTOR    0.35f   /* 接近矩形拐角降速系数: 强减速防过冲冲出角外 */
 #define VEL_STOP_BAND    0.015f  /* 定点锁靶停止带: 速度指令低于此值直接停机, 消除靶心附近微抖/摇摆 */
-/* [v5.8] 误差相关地板: 远线(|err|>TRACE_FLOOR_ERR_PX)用 TRACE_SPEED 跟线速度地板,
+/* [v5.8/v5.10] 误差相关地板: 远线(|err|>TRACE_FLOOR_ERR_PX)用 TRACE_SPEED 跟线速度地板,
  *   近线降到 TRACE_NEAR_FLOOR, 允许误差归零, 消除恒定地板导致的极限环(抖动/偏移) */
 #define TRACE_FLOOR_ERR_PX  25
-#define TRACE_NEAR_FLOOR    0.06f
+#define TRACE_NEAR_FLOOR    0.03f   /* [v5.10] 原0.06→0.03, 近线时几乎停转让误差归零 */
 
 /* ---- Tilt 垂直轴专用限制 (防"激光打到天上") ---- */
 /*   STEPPER_HALF_REV=4096 步 = 360°, 故 1 步 ≈ 0.088° */

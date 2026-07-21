@@ -9,7 +9,7 @@
 
 | 文件 | 说明 |
 |------|------|
-| `main.py` | **当前版本 v5.9（自包含，单文件）**：cv2 矩形角点检测 + LAB 激光检测 + 矩形周长循迹（RECENTER / TRACE_BORDER / TRACE_INNER），三通道传感器（YUV 显示 + 灰度矩形 + RGB565 激光）。**不依赖任何本地模块，部署只需拷这一个文件。** |
+| `main.py` | **当前版本 v5.10（自包含，单文件）**：四线段外框循迹(BorderLineTrace) + 内框密集采样(RectTrajectory) + LAB 激光检测 + 矩形周长循迹（RECENTER / TRACE_BORDER / TRACE_INNER），三通道传感器。**不依赖任何本地模块，部署只需拷这一个文件。** |
 | `rect_detector.py` | **已弃用 / 历史**：早期"基础要求"矩形检测模块（cv2.minAreaRect 旋转框）。v5.2 已内联矩形检测逻辑，不再 import 本文件。保留作参考。 |
 | `backup/main_rect_legacy.py` | 历史版本：rect_detector 集成版 main.py（会 `from rect_detector import ...`，缺模块即 `ImportError`）|
 | `backup/main_yolo_backup.py` | 历史版本：YOLO 检测靶心（已弃用，仅作参考）|
@@ -58,10 +58,12 @@
 
 识别靶板**黑色外框矩形**（A4 边框），位置不固定、可倾斜，以**靶心为坐标原点**上报相对偏移。逻辑封装在 `rect_detector.py` 的 `detect_rect(small, img=None)`：
 
-> **v5.9 双矩形模型（当前）**：
-> - **外矩形（固定）**：画面边缘向内收缩 `OUTER_INSET_RATIO=5%` 的**轴对齐**固定矩形（`fixed_outer_corners()`），不依赖视觉检测。循迹外框时每边只动一个轴（Pan 或 Tilt 单轴），更快更准，速度用更激进的 `OUTER_TRACE_SPEED`（默认 80，可调）。
-> - **内矩形（视觉四点定位）**：电工胶带围成的黑色矩形边框（贴于白 A4 纸上），由 cv2 `find_rect_corners` 检测 4 个角点（四点定位）并 EMA 吸附稳定；`traj_center_frame`（黄色十字“原点”）即该矩形中心。
-> - Task2 `TRACE_BORDER` 走**外框（固定）**；Task3 `TRACE_INNER` 走**内框（胶带）**。
+> **v5.10 四线段外框循迹（当前）**：
+> - **外矩形（BorderLineTrace 四线段）**：画面边缘内缩 5% 的轴对齐固定矩形，循迹改为 **4 条独立直线段**（上→右→下→左），每段只动一个轴（Pan 或 Tilt 单轴）。启动时先从当前位置**直线对齐到最近角点**，再逐边画线。相比 v5.9 密集采样：更稳更快、无拐角过冲、K230 计算量更低。
+> - **LOST 回退优化**：激光丢失时不再反转轨迹方向（避免死循环式 LOST/recovery），改为保持设定点不动，等激光回来后重同步到最近角点。
+> - **内矩形（RectTrajectory 优化）**：取消拐角停留(`CORNER_DWELL_MS=0`)、适度放宽减速区，画线更流畅。
+> - **速度调优**：外框速度 `OUTER_TRACE_SPEED` 从 80 降至 50（减少 LOST 频率）；STM32 端 PID 增益降低（Pan 0.006→0.005, Tilt 0.004→0.003），`TRACE_SPEED` 地板从 0.60 降至 0.45。
+> - Task2 `TRACE_BORDER` 走**外框（四线段）**；Task3 `TRACE_INNER` 走**内框（胶带密集采样）**。
 
 - **入口**：`main.py` 主循环每帧在 320×240 检测空间调用 `detect_rect(small)`（有 cv2 走 cv2 路径；无 cv2 传 `None` 走 `find_rects` 回退）。
 - **cv2 路径**（`detect_rect_cv2`）：灰度 → `GaussianBlur(5×5)` → `adaptiveThreshold(THRESH_BINARY_INV, blockSize=11, C=5)` → `findContours` → 对每个轮廓取 `cv2.minAreaRect` 旋转外接矩形 → 过滤（面积 ≥ `RECT_MIN_AREA_CV`=200，宽高比 0.25~4.0）→ 按 `面积 × 1/(1+|宽高比−1|)` 打分取最优 → 角度归一化到 [−45°,45°)。
@@ -140,4 +142,11 @@ K230 REPL 会周期打印（约每 30 帧）：
   - **任务映射调整**：Task2 `TRACE_BORDER` → 走固定外框；Task3 `TRACE_INNER` → 走视觉检测的内框（胶带）。
   - **提速**：外框循迹速度 `OUTER_TRACE_SPEED`（默认 80，可用 `/data/ti_vision_tune.conf` 的 `outer_speed` 调）高于内框 `TRACE_SPEED`（40）。
   - 启动打印版本号同步为 v5.9；k230 与 stm32 两端版本号对齐为 v5.9。
+
+- **v5.10（四线段外框循迹 + 稳定性提升）**
+  - **BorderLineTrace 四线段循迹器**：外框从 `RectTrajectory` 密集采样改为 4 条独立直线段（上→右→下→左），每段只动单轴。启动时先直线对齐到最近角点再画线。无拐角减速/停留，自然过渡。
+  - **LOST 回退不再反转方向**：保持设定点不动等激光回来，消除 LOST/reverse/LOST 死循环。
+  - **内框优化**：取消拐角停留(`CORNER_DWELL_MS=0`)、放宽减速参数，画线更流畅。
+  - **速度与 PID 调优**：`OUTER_TRACE_SPEED` 80→50；STM32 Pan 增益 0.006→0.005, Tilt 0.004→0.003；`TRACE_SPEED` 地板 0.60→0.45；`TRACE_NEAR_FLOOR` 0.06→0.03。
+  - 启动打印版本号同步为 v5.10。
 
