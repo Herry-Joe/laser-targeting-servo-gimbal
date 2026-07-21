@@ -363,7 +363,8 @@ static void K230_PID_Init(K230_PID *pid,
 #define PID_ILIMIT      20.0f
 #define PID_DEADZONE    3       /* 死区 (像素) — Pan 轴 */
 #define PID_DEADZONE_TILT 4     /* Tilt 轴死区 */
-#define K230_HYST_PX    4       /* 滞回迟滞(px): 锁靶后误差需超 死区+此值 才重新驱动, 消除边界微抖 */
+#define K230_HYST_PX    12      /* 滞回迟滞(px): 锁靶后误差需超 死区+此值 才重新驱动.
+                                    * [v5.8] 4→12: K230 误差噪声约 ±15px, 增大迟滞避免噪声触发反复反向(消 AIM 模式摇摆) */
 #define HIT_RELEASE_PX  40      /* 命中锁存后, 误差超此值(px)才重新捕获(远大于命中容差15px, 根治靶心附近抖停不停) */
 
 /* ---- [v5.7] 矩形循迹速度整形 ---- */
@@ -379,7 +380,7 @@ static void K230_PID_Init(K230_PID *pid,
 /*   STEPPER_HALF_REV=4096 步 = 360°, 故 1 步 ≈ 0.088° */
 #define TILT_DEADZONE      4       /* 垂直轴死区(像素) — 收紧, 避免停在离靶心 8px 处 */
 #define TILT_MAX_STEPS     300     /* 垂直轴软限位 = ±300步 ≈ ±30° (1M 靶距足够, 垂直向不需大幅摆动) */
-#define PAN_MAX_STEPS      400     /* 水平轴软限位 = ±400步 ≈ ±40° (控转动范围, 防过冲/大幅摆动) */
+#define PAN_MAX_STEPS      450     /* 水平轴软限位 = ±450步 ≈ ±45° (与位置环一致; 实测可到 ±45° 安全) */
 #define TILT_SPEED_SCALE   0.6f    /* 垂直轴最高速度 = Pan 的 60% (小幅缓动) */
 
 /* PID 实例: 字段全部用 K230_PID_Init 初始化 (见 main() 内调用) */
@@ -1748,7 +1749,7 @@ static void K230_ControlAxis(StepperMotor *motor, K230_PID *pid,
                 K230_PID_Reset(pid);
                 kf->init = 0;
                 *out_filter = 0.0f;
-                *vel_ema = 0.0f;
+                /* 注意: 不清 vel_ema, 保留上次方向记忆, 避免噪声使误差小幅反向时反复启停(消摇摆) */
                 pid->locked = 1;
                 return;
             }
@@ -1769,11 +1770,22 @@ static void K230_ControlAxis(StepperMotor *motor, K230_PID *pid,
         if (delay_us < STEPPER_MIN_DELAY_US) delay_us = STEPPER_MIN_DELAY_US;
         if (delay_us > STEPPER_MAX_DELAY_US) delay_us = STEPPER_MAX_DELAY_US;
 
-        /* 垂直轴硬限位: 超出安全行程则停转并清状态 */
+        /* 软限位: 超出安全行程则停转并清状态.
+         * [v5.8 修复] 旧逻辑 next>+LIM||next<-LIM 在电机已停在限位外(如位置环先把它
+         *   带到了 ±LIM 之外)时会双向锁死, 该轴永远无法回到限位内 → 长期不动(Pan 卡死即此因).
+         *   新逻辑: 仅禁止"进一步向外"的步进, 允许从限位外向中心回拉, 保证可恢复. */
         if (pos_limit_steps > 0) {
             int32_t pos = Stepper_GetPosition(motor);
             int32_t next = (dir == DIR_CW) ? pos + 1 : pos - 1;
-            if (next > pos_limit_steps || next < -pos_limit_steps) {
+            int blocked = 0;
+            if (pos >= pos_limit_steps) {
+                if (dir == DIR_CW) blocked = 1;          /* 已在 +限位外, 禁止继续 + */
+            } else if (pos <= -pos_limit_steps) {
+                if (dir == DIR_CCW) blocked = 1;         /* 已在 -限位外, 禁止继续 - */
+            } else if (next > pos_limit_steps || next < -pos_limit_steps) {
+                blocked = 1;                             /* 正常区间: 禁止越界 */
+            }
+            if (blocked) {
                 if (Stepper_GetState(motor) != STATE_IDLE) Stepper_Stop(motor);
                 K230_PID_Reset(pid);
                 kf->init = 0;
