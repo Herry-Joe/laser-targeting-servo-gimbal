@@ -963,7 +963,13 @@ static void PrintHelp(void)
     printf("  ║ [模式]                                   ║\r\n");
     printf("  ║   k            K230 自动打靶模式           ║\r\n");
     printf("  ║   m            手动/位置闭环模式            ║\r\n");
-    printf("  ║   stop         紧急停止                    ║\r\n");
+    printf("  ║   stop         紧急停止(同步停 K230 任务)   ║\r\n");
+    printf("  ╠══════════════════════════════════════════╣\r\n");
+    printf("  ║ [K230 任务]                              ║\r\n");
+    printf("  ║   aim          自动打靶(跟随误差)          ║\r\n");
+    printf("  ║   recenter     激光对中到 A4 中心          ║\r\n");
+    printf("  ║   border       外框循迹(固定矩形/单轴)      ║\r\n");
+    printf("  ║   inner        内框循迹(电工胶带四点定位)    ║\r\n");
     printf("  ╠══════════════════════════════════════════╣\r\n");
     printf("  ║ [PID 调参]                                ║\r\n");
     printf("  ║   pid p/t kp/ki/kd <值>  位置环调参       ║\r\n");
@@ -1015,6 +1021,11 @@ static void PrintStatus(void)
 static uint8_t g_telemetry_enabled = 0;  /* 默认关闭遥测 */
 
 /* ========================== 串口命令执行 (在主循环调用, 非 ISR) ========================== */
+
+/* [v5.10] 前向声明: 供串口任务命令(aim/recenter/border/inner)在 Serial_Execute 中调用 */
+static void K230_SendCmd(uint8_t cmd);
+static void K230_HandleCommand(uint8_t cmd);
+static void TriggerK230Task(uint8_t cmd);
 
 static void Serial_Execute(void)
 {
@@ -1136,6 +1147,7 @@ static void Serial_Execute(void)
         Stepper_Stop(&g_motor_pan);
         Stepper_Stop(&g_motor_tilt);
         g_gimbal_mode = GIMBAL_POSCTRL;
+        K230_SendCmd(K230_CMD_STOP);   /* [v5.10] 同步通知 K230 停止任务 */
         CmdReply("# OK 停止\r\n");
         return;
     }
@@ -1167,6 +1179,28 @@ static void Serial_Execute(void)
         } else {
             CmdReply("# tele on/off  — 遥测开关\r\n");
         }
+        return;
+    }
+
+    /* ---- [v5.10] K230 任务触发命令 (上位机菜单用): 与板载 PA0/PA1 等价 ---- */
+    if (strncmp(p, "aim", 3) == 0) {
+        TriggerK230Task(K230_CMD_AIM);
+        CmdReply("# OK → AIM 自动打靶(跟随误差)\r\n");
+        return;
+    }
+    if (strncmp(p, "recenter", 8) == 0) {
+        TriggerK230Task(K230_CMD_RECENTER);
+        CmdReply("# OK → RECENTER 激光对中到 A4 中心\r\n");
+        return;
+    }
+    if (strncmp(p, "border", 6) == 0) {
+        TriggerK230Task(K230_CMD_TRACE_BORDER);
+        CmdReply("# OK → BORDER 外框循迹(固定矩形/单轴)\r\n");
+        return;
+    }
+    if (strncmp(p, "inner", 5) == 0) {
+        TriggerK230Task(K230_CMD_TRACE_INNER);
+        CmdReply("# OK → INNER 内框循迹(电工胶带四点定位)\r\n");
         return;
     }
 
@@ -1489,6 +1523,14 @@ static void PosCtrl_SendTelemetry(void)
     }
 }
 
+/* 镜像一行遥测到 USART1(CH340/上位机): 单口即可收全部数据, 不依赖蓝牙 */
+static void Telemetry_MirrorToU1(const char *buf, int n)
+{
+    if (n <= 0) return;
+    if (!HAL_IS_BIT_SET(huart1.Instance->CR1, USART_CR1_UE)) return;
+    HAL_UART_Transmit(&huart1, (uint8_t*)buf, n, 10);
+}
+
 /* ========================== 矩形循迹测试模式 ========================== */
 
 static void Trace_Init(int32_t half_size)
@@ -1605,6 +1647,7 @@ static void K230_SendRectTelemetry(void)
         (g_rect_valid ? 1 : 0) | (g_rect_origin_valid ? 2 : 0));
     if (n > 0) {
         BT_UART_PutStr(buf, n);
+        Telemetry_MirrorToU1(buf, n);   /* [v5.10] 镜像到 USART1 */
     }
 }
 
@@ -1623,6 +1666,7 @@ static void K230_SendTaskTelemetry(void)
                      (int)g_k230_task_id, (int)g_k230_task_done);
     if (n > 0) {
         BT_UART_PutStr(buf, n);
+        Telemetry_MirrorToU1(buf, n);   /* [v5.10] 镜像到 USART1 */
     }
 }
 
@@ -1640,6 +1684,17 @@ static void K230_SendCmd(uint8_t cmd)
     buf[4] = 0;    buf[5] = 0; buf[6] = 0;
     buf[7] = 1;    buf[8] = 1;
     HAL_UART_Transmit(&huart3, buf, 9, 20);
+}
+
+/**
+ * @brief [v5.10] 串口/上位机触发 K230 任务: 既通知 K230 切换任务,
+ *        又同步 STM32 本地镜像(任务ID/模式/解锁), 与板载 PA0/PA1 等价.
+ *        PC 上位机发送 aim/recenter/border/inner 即走此路径.
+ */
+static void TriggerK230Task(uint8_t cmd)
+{
+    K230_SendCmd(cmd);        /* 命令帧发往 K230 (USART3) */
+    K230_HandleCommand(cmd);  /* 更新 STM32 本地状态: 任务ID/AUTO/解锁/复位 */
 }
 
 /* ---- v4.3: PID 输出低通滤波 (每轴) ---- */
@@ -2579,6 +2634,7 @@ static void BT_SendReport(void)
 
     if (n > 0) {
         BT_UART_PutStr(buf, n);   /* 非阻塞发送, 不再阻塞主循环(原 250ms 卡顿根因) */
+        Telemetry_MirrorToU1(buf, n);   /* [v5.10] 镜像到 USART1(CH340/上位机) */
     }
 
     /* 同步转发矩形识别结果(相对靶心原点) */
@@ -2768,6 +2824,7 @@ int main(void)
     printf("\r\n");
     printf("  ╔═══════════════════════════╗\r\n");
     printf("  ║   舵机云台 控制系统 V1.0   ║\r\n");
+    printf("  ║   Firmware v5.11 (K230任务串口触发) ║\r\n");
     printf("  ║   STM32F103C8T6 @ 72MHz  ║\r\n");
     printf("  ║   Pan: PB1  Tilt: PA11   ║\r\n");
     printf("  ╚═══════════════════════════╝\r\n");
