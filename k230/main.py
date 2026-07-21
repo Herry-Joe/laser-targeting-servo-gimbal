@@ -536,14 +536,17 @@ def send_cmd(uart, cmd, param=0):
 # 帧格式同 send_cmd: 0x3C 0x3C [CMD] [PARAM] 0x00 0x00 0x00 0x01 0x01
 _host_fstate = 0   # 0=等待首 0x3C, 1=等待第二 0x3C, 2=等待 CMD
 def parse_host_command(uart):
-    """每帧调用, 返回解析到的 CMD 字节(0=无). 仅取 CMD, 忽略后续填充字节."""
+    """每帧调用, 返回解析到的 CMD 字节(0=无). 仅取 CMD, 忽略后续填充字节.
+    [v5.7 修复] CanMV K230 的 UART 没有 readchar() 方法, 改用 read(1) 逐字节解析.
+    """
     global _host_fstate
     if uart is None:
         return 0
     while uart.any():
-        b = uart.readchar()
-        if b < 0:
+        chunk = uart.read(1)
+        if not chunk:
             break
+        b = chunk[0]
         if _host_fstate == 0:
             if b == 0x3C:
                 _host_fstate = 1
