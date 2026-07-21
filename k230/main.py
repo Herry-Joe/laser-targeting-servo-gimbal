@@ -892,16 +892,24 @@ def _filter_laser_blobs(blobs, acquire=False):
     return cands
 
 
+def _blob_geom_center(b):
+    """激光视为圆形色块: 以几何中心(外接框中心)为坐标.
+    相比质心 cx()/cy()(像素质量中心), 外接框中心对不对称光晕/卫星像素更鲁棒,
+    对规整圆形光斑二者重合; 这是"以几何中心为坐标"的实现."""
+    return (b.x() + b.w() // 2, b.y() + b.h() // 2)
+
+
 def _nearest_in_window(cands, ref_x, ref_y, max_d):
     best = None
     best_d2 = max_d * max_d
     for b, px, ratio, fill in cands:
-        dx = b.cx() - ref_x
-        dy = b.cy() - ref_y
+        gx, gy = _blob_geom_center(b)
+        dx = gx - ref_x
+        dy = gy - ref_y
         d2 = dx * dx + dy * dy
         if d2 <= best_d2:
             best_d2 = d2
-            best = (b.cx(), b.cy())
+            best = (gx, gy)
     if best is None:
         return -1, -1, False
     return best[0], best[1], True
@@ -969,7 +977,8 @@ def detect_laser(laser_img, prev_x, prev_y, pred_x, pred_y,
                 # 这级找到了但都不在窗口内 → 继续试下一级 (更宽泛)
             else:
                 best = max(cands, key=lambda t: t[3] / (1.0 + t[1] * 0.01))
-                return best[0].cx(), best[0].cy(), True
+                gx, gy = _blob_geom_center(best[0])
+                return gx, gy, True
     return -1, -1, False
 
 
