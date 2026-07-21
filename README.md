@@ -12,6 +12,7 @@
         │  摄像头 + 同轴红色激光器                                │
         │  靶心检测 : cv2 轮廓（优先方框 4 边，否则同心圆矩心）     │
         │  激光检测 : CanMV find_blobs（LAB 阈值，已验证可用）      │
+        │  矩形检测 : cv2.minAreaRect（旋转框，任意位置/倾斜）      │
         │  置信度门控 + 2 帧去抖 + 粘性命中锁                      │
         └───────────────┬ USART2 @115200 ───────────┬────────────┘
                         │ GPIO05(TX) → PB11          │ GPIO06(RX) ← PB10
@@ -70,7 +71,8 @@
 │   └── README.md              # STM32 端详细说明
 │
 ├── k230/                      # K230 视觉端程序（CanMV / MicroPython）
-│   ├── main.py                # 打靶追踪主程序（cv2 靶心 + find_blobs 激光）
+│   ├── main.py                # 打靶追踪主程序（cv2 靶心 + find_blobs 激光 + 矩形识别）
+│   ├── rect_detector.py       # 矩形检测模块（cv2.minAreaRect，任意位置/倾斜）
 │   ├── backup/                # 历史版本备份（YOLO 版 / 非 YOLO 版）
 │   └── README.md              # K230 端说明
 │
@@ -121,6 +123,36 @@ arm-none-eabi-objcopy -O ihex .pio/build/bluepill_f103c8/firmware.elf servo_gimb
 - **CRC8**：poly 0x07，覆盖 `[XH .. FLAG]`
 
 **命令帧（STM32 → K230，9 字节）：** `0x3C 0x3C [CMD][PARAM] ...`（预留，主要用于解锁等）。
+
+### 4. 矩形帧（K230 → STM32，16 字节，新增 / E 题基础要求）
+
+```
+0x3C 0x3A [DXH][DXL] [DYH][DYL] [WH][WL] [HH][HL] [ANGH][ANGL] [FLAGS] [CRC8] 0x01 0x01
+```
+
+- **DX / DY**：矩形中心相对**靶心（画面坐标原点）**的像素偏移（显示空间 800×480；正 = 矩形在靶心右 / 下方）。
+- **W / H**：矩形宽、高（像素，显示空间）。
+- **ANG**：矩形倾斜角，以 0.1° 为单位的有符号整数（int16，范围约 ±450 = ±45°）。
+- **FLAGS**：`bit0 = rect_valid`（已检测到矩形）、`bit1 = origin_valid`（靶心有效，此时偏移才有意义）。
+- **CRC8**：poly 0x07，init 0x00，覆盖前面 11 字节数据 `[DXH..ANGL]`。
+
+> STM32 在 USART3 中断里按 `g_k230_ftype` 分支解析（0=坐标帧 / 1=矩形帧），与原有坐标帧共存、互不干扰。解析成功后通过 `K230_SendRectTelemetry()` 以 `RECT,<dx>,<dy>,<w>,<h>,<ang>,<origin>` 行经蓝牙（USART2@9600）转发至上位机。
+
+### 5. 矩形识别与 E 题基础要求（2023 全国大学生电子设计竞赛 E 题）
+
+**目标**：用 K230 的 OpenCV 支持库识别靶板上**黑色外框矩形**（A4 边框），矩形摆放位置不固定、可倾斜，需具备任意位置检测能力；激光仍瞄准靶心，矩形只作为相对靶心的位置信息上报。
+
+**实现要点**（`k230/rect_detector.py` + `k230/main.py`）：
+
+1. **检测算法**：在 320×240 检测空间做灰度 → 高斯模糊(5×5) → 自适应阈值二值化（THRESH_BINARY_INV，block=11，C=5）→ 找轮廓 → 对每个轮廓取 `cv2.minAreaRect` 旋转外接矩形（天然支持倾斜/任意位置）。
+2. **筛选**：面积 ≥ 200 像素，宽高比 0.25~4.0；按「面积 × 1/(1+|宽高比−1|)」打分取最优，角度归一化到 [−45°,45°)。
+3. **坐标系**：以已识别的**靶心**为坐标原点（非画面中心），矩形中心偏移 = 矩形中心 − 靶心（右/下为正），并做 EMA 平滑（`RECT_SMOOTH_ALPHA = 0.30`）提升稳定性。
+4. **回退路径**：若 cv2 不可用（非 OpenCV daily build 固件），自动回退到 CanMV `img.find_rects()` 慢速路径（1~2fps），保证功能可用。
+5. **OSD**：画面叠加旋转矩形框（紫色）、靶心十字（绿）、矩形中心圆点、偏移向量线及 `RECT:(dx,dy) WxH ang` 文本，便于现场调试。
+
+**上位机显示**（`stm32_servo_gimbal/bluetooth_app/webserial.html`，新增「矩形识别」卡片）：
+- 解析 `RECT,` 遥测行，以画布中心为靶心原点，按缩放比例绘制紫色旋转矩形与青色偏移向量；
+- 实时显示 `dx / dy / W / H / 角度 / 靶心有效` 读数与 `rect_valid` 状态徽标。
 
 ---
 

@@ -70,6 +70,12 @@ extern "C" {
 #define KEY_MODE_PORT          GPIOB
 #define KEY_MODE_PIN           GPIO_PIN_15      /* 模式切换 */
 
+/* PA0/PA1: 用户加装独立按键 (上拉输入, 按下=低电平) */
+#define KEY_PA0_PORT           GPIOA
+#define KEY_PA0_PIN            GPIO_PIN_0       /* 功能键: 自动打靶开关 / 长按回中 */
+#define KEY_PA1_PORT           GPIOA
+#define KEY_PA1_PIN            GPIO_PIN_1       /* 循迹键: 矩形循迹开关 / 长按解锁命中 */
+
 /* ========================== LED ========================== */
 #define LED_PORT               GPIOC
 #define LED_PIN                GPIO_PIN_13      /* 板载 LED (Blue Pill) */
@@ -97,6 +103,17 @@ extern "C" {
 #define K230_TX_PIN            GPIO_PIN_10     /* USART3 TX */
 #define K230_RX_PORT           GPIOB
 #define K230_RX_PIN            GPIO_PIN_11     /* USART3 RX */
+
+/* ========================== K230 矩形识别帧 ========================== */
+/* 矩形帧 K230 → STM32 (USART3): 0x3C 0x3A [10数据][FLAGS][CRC8] 0x01 0x01
+ * 数据(大端): CXH CXL CYH CYL WH WL HH HL ANGH ANGL
+ *   CX/CY = int16 矩形中心相对靶心偏移(px)
+ *   W/H   = uint16 矩形宽高(px)
+ *   ANG   = int16 倾斜角(0.1°)
+ * FLAGS  = bit0 rect_valid, bit1 origin_valid(靶心有效→偏移可信)
+ * CRC8 poly0x07 init0 覆盖 [10数据+FLAGS] 共 11 字节, 与 K230 端一致 */
+#define K230_RECT_HEADER0   0x3C
+#define K230_RECT_HEADER1   0x3A
 
 /* ========================== OLED (SSD1306 I2C, 辅助串口调试) ========================== */
 /* 注意: I2C1 默认引脚是 PB6/PB7, 但本工程中 PB6/PB7 已被 Tilt 电机占用,
@@ -166,6 +183,8 @@ extern "C" {
 #define KEY_DOWN_READ()   HAL_GPIO_ReadPin(KEY_DOWN_PORT, KEY_DOWN_PIN)
 #define KEY_DIR_READ()    HAL_GPIO_ReadPin(KEY_DIR_PORT, KEY_DIR_PIN)
 #define KEY_MODE_READ()   HAL_GPIO_ReadPin(KEY_MODE_PORT, KEY_MODE_PIN)
+#define KEY_PA0_READ()    HAL_GPIO_ReadPin(KEY_PA0_PORT, KEY_PA0_PIN)
+#define KEY_PA1_READ()    HAL_GPIO_ReadPin(KEY_PA1_PORT, KEY_PA1_PIN)
 
 /* ========================== 公共函数声明 ========================== */
 void SystemClock_Config(void);

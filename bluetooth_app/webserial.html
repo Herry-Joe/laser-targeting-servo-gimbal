@@ -217,6 +217,33 @@
     </div>
   </div>
 
+  <!-- K230 任务状态 / 完成 -->
+  <div class="card" id="taskCard" style="display:none">
+    <div class="section">📋 任务状态 <span class="badge" id="taskBadge">IDLE</span></div>
+    <div class="tg">
+      <span class="l">当前任务</span><span class="v" id="taskName">--</span>
+      <span class="l">运行状态</span><span class="v" id="taskRun">待命</span>
+      <span class="l">完成</span><span class="v" id="taskDone">--</span>
+    </div>
+  </div>
+
+  <!-- 矩形识别 (靶板外框) 状态 -->
+  <div class="card" id="rectCard" style="display:none">
+    <div class="section">🔲 矩形识别 (靶板外框) <span class="badge" id="rectValid">--</span></div>
+    <div class="row" style="gap:16px;align-items:flex-start">
+      <div class="tg" style="flex:1">
+        <span class="l">中心X偏移</span><span class="v c" id="rDx">--</span>
+        <span class="l">中心Y偏移</span><span class="v c" id="rDy">--</span>
+        <span class="l">宽度 W</span><span class="v" id="rW">--</span>
+        <span class="l">高度 H</span><span class="v" id="rH">--</span>
+        <span class="l">倾斜角</span><span class="v" id="rAng">--</span>
+        <span class="l">原点有效</span><span class="v" id="rOrigin">--</span>
+      </div>
+      <canvas id="rectCanvas" width="200" height="200" style="background:#060a14;border-radius:6px;flex-shrink:0"></canvas>
+    </div>
+    <div class="hint">以靶心为原点: 偏移 = 矩形中心 − 靶心 (右/下为正)。倾斜角为矩形相对水平的旋转。</div>
+  </div>
+
   <!-- PID 实时曲线 (双轴: 误差px + PID输出) -->
   <div class="card">
     <div class="section">
@@ -463,6 +490,96 @@ function parseReport(line) {
   pushChartData(panErr, tiltErr, pidP, pidT);
 }
 
+/* ---- K230 任务状态 (TASK,id,done) —— 命令帧切换 + 完成上报 ---- */
+const TASK_NAMES = ['IDLE / AIM (自动跟随)', 'RECENTER (激光对中)', 'BORDER (绕外框)', 'INNER (绕内框)'];
+function parseTask(line) {
+  const p = line.split(',');
+  if (p.length < 3) return;
+  const id   = parseInt(p[1]) || 0;
+  const done = p[2].trim() === '1';
+
+  $('taskCard').style.display = 'block';
+  $('taskName').textContent = TASK_NAMES[id] || ('未知#' + id);
+  $('taskBadge').textContent = id === 0 ? 'IDLE' : ('T' + id);
+
+  if (done) {
+    $('taskRun').textContent  = '✅ 完成';
+    $('taskRun').style.color  = '#00ff88';
+    $('taskDone').textContent = 'YES ✓';
+    $('taskDone').style.color = '#00ff88';
+  } else if (id !== 0) {
+    $('taskRun').textContent  = '进行中…';
+    $('taskRun').style.color  = '#ffd166';
+    $('taskDone').textContent = 'NO';
+    $('taskDone').style.color = '#ffd166';
+  } else {
+    $('taskRun').textContent  = '待命';
+    $('taskRun').style.color  = 'var(--muted)';
+    $('taskDone').textContent = '--';
+    $('taskDone').style.color = 'var(--muted)';
+  }
+}
+
+/* ---- 矩形识别结果 (RECT,dx,dy,w,h,ang,valid) ---- */
+const rectState = { dx:0, dy:0, w:0, h:0, ang:0, valid:0, origin:0 };
+const rectCanvas = document.getElementById('rectCanvas');
+const rctx = rectCanvas.getContext('2d');
+
+function parseRect(line) {
+  const p = line.split(',');
+  if (p.length < 7) return;
+  let v = parseInt(p[6]) || 0;
+  rectState.origin = (v & 2) ? 1 : 0;
+  rectState.valid = (v & 1) ? 1 : 0;
+  rectState.dx = parseInt(p[1]) || 0;
+  rectState.dy = parseInt(p[2]) || 0;
+  rectState.w  = parseInt(p[3]) || 0;
+  rectState.h  = parseInt(p[4]) || 0;
+  rectState.ang = parseInt(p[5]) || 0;
+
+  $('rectCard').style.display = 'block';
+  $('rectValid').textContent = rectState.valid ? 'VALID' : '无效';
+  $('rectValid').style.color = rectState.valid ? '#00ff88' : '#ff4d6d';
+  $('rDx').textContent = (rectState.dx>0?'+':'') + rectState.dx + 'px';
+  $('rDy').textContent = (rectState.dy>0?'+':'') + rectState.dy + 'px';
+  $('rW').textContent  = rectState.w + 'px';
+  $('rH').textContent  = rectState.h + 'px';
+  $('rAng').textContent = (rectState.ang/10).toFixed(1) + '°';
+  $('rOrigin').textContent = rectState.origin ? 'YES' : 'NO';
+  $('rOrigin').className = 'v' + (rectState.origin ? ' o' : ' e');
+  drawRectCanvas();
+}
+
+function drawRectCanvas() {
+  const W = rectCanvas.width, H = rectCanvas.height;
+  rctx.clearRect(0,0,W,H);
+  rctx.fillStyle = '#060a14'; rctx.fillRect(0,0,W,H);
+  const cx = W/2, cy = H/2;   // 靶心 = 画布中心(原点)
+  // 坐标轴
+  rctx.strokeStyle = 'rgba(255,255,255,0.12)'; rctx.lineWidth = 1;
+  rctx.beginPath(); rctx.moveTo(0, cy); rctx.lineTo(W, cy); rctx.moveTo(cx, 0); rctx.lineTo(cx, H); rctx.stroke();
+  // 靶心十字(绿)
+  rctx.strokeStyle = '#00ff88'; rctx.lineWidth = 1.5;
+  rctx.beginPath(); rctx.moveTo(cx-6, cy); rctx.lineTo(cx+6, cy); rctx.moveTo(cx, cy-6); rctx.lineTo(cx, cy+6); rctx.stroke();
+  if (!rectState.valid) return;
+  // 自适应比例
+  const scale = (Math.min(W,H) * 0.42) / Math.max(1, Math.max(rectState.w, rectState.h, Math.abs(rectState.dx), Math.abs(rectState.dy)));
+  const rx = cx + rectState.dx * scale;
+  const ry = cy + rectState.dy * scale;
+  const rw = Math.max(4, rectState.w * scale);
+  const rh = Math.max(4, rectState.h * scale);
+  const ang = rectState.ang / 10 * Math.PI / 180;
+  rctx.save();
+  rctx.translate(rx, ry);
+  rctx.rotate(ang);
+  rctx.strokeStyle = '#b14bff'; rctx.lineWidth = 2;
+  rctx.strokeRect(-rw/2, -rh/2, rw, rh);
+  rctx.restore();
+  // 偏移向量(青)
+  rctx.strokeStyle = '#00e5ff'; rctx.lineWidth = 1.5;
+  rctx.beginPath(); rctx.moveTo(cx, cy); rctx.lineTo(rx, ry); rctx.stroke();
+}
+
 /* ---- P 回显解析: 读取当前 PID 填入滑块 ---- */
 function parsePidReply(line) {
   if (line.includes('Pan') && line.includes('PID')) lastPidAxis = 'p';
@@ -524,6 +641,13 @@ function handleData(value) {
       if (l !== lastK230Line) log(l);
       lastK230Line = l;
       parseReport(l);
+    } else if (l.startsWith('RECT,')) {
+      lastK230Line = '';
+      log(l, '#b14bff');
+      parseRect(l);
+    } else if (l.startsWith('TASK,')) {
+      lastK230Line = '';
+      parseTask(l);
     } else {
       lastK230Line = '';
       log(l);
