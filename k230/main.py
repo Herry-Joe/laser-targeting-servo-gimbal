@@ -135,7 +135,7 @@ RECT_EDGE_MARGIN = 0
 # 边框吸附速度 (锁定后, 每帧把锁定角点朝真实角点 EMA 贴合)
 RECT_SNAP_ALPHA         = 0.35   # 贴合速率 (0~1) [v5.2: 0.4→0.35]
 RECT_MOVE_PX_PER_FRAME  = 1.5   # 边框中心帧间位移超过此值 → 判"在动", 强制每帧检测
-RECT_HOLD_FRAMES         = 5     # 检测丢失时保持上一框并外推最多这么多帧 [v5.2: 6→5]
+RECT_HOLD_FRAMES         = 6     # [v5.7] 检测丢失时保持上一框并外推最多这么多帧 (抗小概率失误)
 RECT_HOLD_EXTRAPOLATE    = True
 
 # ----- 循迹参数 (矩形周长行走) -----
@@ -176,6 +176,9 @@ RED_LASER_LAB_WIDE   = [(40, 82, 18, 78, -34, 5)]    # 弱光/偏色
 RED_LASER_LAB_HOT     = [(55, 95, 35, 88, -25, 25)]  # 过曝兜底
 RED_LASER_LAB_USER    = [(66, 87, 37, 58, 7, 33)]    # 用户实测激光 LAB
 RED_LASER_LAB_USER2   = [(39, 60, 58, 79, 19, 38)]   # 用户实测 LAB 2
+# [v5.7] 用户实测阈值: 亮度偏低(激光变暗)时的红色范围 (L 58~84, A 16~37, B -10~9)
+#   L 下限比其它集更低 → 暗激光也能抓到; 作为最高优先级先行尝试.
+RED_LASER_LAB_DIM     = [(58, 84, 16, 37, -10, 9)]
 LASER_LAB_NARROW = ([(90, 100, -7, 23, -12, 25)] +  # 窄中心核
                     RED_LASER_LAB_USER2)
 # v5.2: 4 级渐进式 LAB 阈值表 (每级是上一级的超集)
@@ -186,7 +189,7 @@ LASER_LAB_WIDE   = (LASER_LAB_CENTER +
 LASER_LAB_HOT    = (LASER_LAB_WIDE +
                     RED_LASER_LAB_HOT +
                     RED_LASER_LAB_USER)
-LASER_MIN_PX          = 3
+LASER_MIN_PX          = 2     # [v5.7] 降低: 激光变暗/变小(像素少)也能识别
 LASER_WASHOUT_PX      = 1500      # 整屏泛红拒识
 LASER_ACQUIRE_MAX_PX  = 1000      # 初始捕获最大像素
 LASER_LOCK_FRAMES     = 2
@@ -213,7 +216,7 @@ LASER_RECOVER_GIVEUP_MS  = 6000   # [v5.2: 4000→6000]
 OUTPUT_PROTOCOL = "binary"
 
 # ----- 循环节奏 -----
-DETECT_INTERVAL        = 2    # 矩形检测降频 (1=每帧)
+DETECT_INTERVAL        = 3    # [v5.7] 矩形检测降频 (1=每帧); 提高识别/传输频率, 视觉闭环更流畅
 UART_SEND_INTERVAL     = 1
 OSD_REFRESH_INTERVAL    = 1
 DEBUG_PRINT_INTERVAL   = 30
@@ -478,9 +481,10 @@ def crc8(data):
     return crc & 0xFF
 
 
-def send_binary(uart, x, y, valid, hit, hi_conf, boot=False, hold=False):
+def send_binary(uart, x, y, valid, hit, hi_conf, boot=False, hold=False, corner=False):
     """坐标帧: 0x3C 0x3B [XH][XL][YH][YL][FLAG][CRC8] 0x01 0x01 (10字节)
-    [v5.2] FLAG 扩展: bit3=BOOT(开机回中), bit4=HOLD(激光丢失保持速度)"""
+    [v5.2] FLAG 扩展: bit3=BOOT(开机回中), bit4=HOLD(激光丢失保持速度)
+    [v5.7] bit5=NEAR_CORNER(接近矩形拐角, 请求 STM32 减速防过冲)"""
     if not uart:
         return 0
     buf = bytearray(10)
@@ -498,6 +502,7 @@ def send_binary(uart, x, y, valid, hit, hi_conf, boot=False, hold=False):
     if hi_conf: f |= 4    # bit2 = hi_conf
     if boot:  f |= 8      # bit3 = BOOT  [v5.2 新增]
     if hold:  f |= 16     # bit4 = HOLD  [v5.2 新增]
+    if corner: f |= 32    # bit5 = NEAR_CORNER [v5.7 新增]
     buf[6] = f
     buf[7] = crc8(bytes([buf[2], buf[3], buf[4], buf[5], buf[6]]))
     buf[8] = 1
@@ -527,12 +532,39 @@ def send_cmd(uart, cmd, param=0):
     return uart.write(buf)
 
 
+# ---- STM32 → K230 命令帧解析 (PA0/PA1 按键经 STM32 发给 K230 控制任务) ----
+# 帧格式同 send_cmd: 0x3C 0x3C [CMD] [PARAM] 0x00 0x00 0x00 0x01 0x01
+_host_fstate = 0   # 0=等待首 0x3C, 1=等待第二 0x3C, 2=等待 CMD
+def parse_host_command(uart):
+    """每帧调用, 返回解析到的 CMD 字节(0=无). 仅取 CMD, 忽略后续填充字节."""
+    global _host_fstate
+    if uart is None:
+        return 0
+    while uart.any():
+        b = uart.readchar()
+        if b < 0:
+            break
+        if _host_fstate == 0:
+            if b == 0x3C:
+                _host_fstate = 1
+        elif _host_fstate == 1:
+            if b == 0x3C:
+                _host_fstate = 2
+            else:
+                _host_fstate = 0
+        else:  # _host_fstate == 2: 收到 CMD
+            _host_fstate = 0
+            return b
+    return 0
+
+
 def send_trace(uart, desired_frame, laser_frame, valid, done,
-               hold=False, boot=False):
+               hold=False, boot=False, corner=False):
     """把当前循迹设定点发给云台.
     binary 模式: err = desired - reference (laser 或 画面中心)
     ascii  模式: 发设定点绝对坐标 (供追点电机用)
     [v5.2] 新增 hold/boot FLAG 位 (仅 binary 模式生效)
+    [v5.7] 新增 corner(NEAR_CORNER) FLAG 位
     """
     if OUTPUT_PROTOCOL == "ascii":
         ok = desired_frame is not None
@@ -550,7 +582,7 @@ def send_trace(uart, desired_frame, laser_frame, valid, done,
             ey = desired_frame[1] - FRAME_H // 2
     else:
         ex = ey = 0
-    return send_binary(uart, ex, ey, valid, done, valid, boot, hold)
+    return send_binary(uart, ex, ey, valid, done, valid, boot, hold, corner)
 
 
 # ========================= 矩形几何 =========================
@@ -879,8 +911,9 @@ def detect_laser(laser_img, prev_x, prev_y, pred_x, pred_y,
     if not laser_img:
         return -1, -1, False
 
-    # v5.2: 4 级渐进式 LAB 阈值表 (每级是上一级的超集)
-    lab_levels = (LASER_LAB_NARROW, LASER_LAB_CENTER,
+    # v5.7: 5 级渐进式 LAB 阈值表. DIM 集(L 下限更低)放最前, 优先捕获变暗的激光;
+    #   后续各级是逐级放宽(超集), 直到 HOT 兜底.
+    lab_levels = (RED_LASER_LAB_DIM, LASER_LAB_NARROW, LASER_LAB_CENTER,
                   LASER_LAB_WIDE, LASER_LAB_HOT)
 
     # 1) ROI 搜索 (锁定后, 在预测点附近小窗找)
@@ -1302,6 +1335,11 @@ def main():
 
             # ---- 按键多击/长按 → 任务命令 ----
             cmd, param = key_sm.update(uart)
+            # [v5.7] STM32(PA0/PA1 按键)发来的命令帧 → 同样切换 K230 任务
+            host_cmd = parse_host_command(uart)
+            if cmd == 0 and host_cmd != 0:
+                cmd = host_cmd
+                param = 0
             # [v5.2] BOOT 模式期间按键无效 (必须等 BOOT 完成)
             if task_mode == TASK_BOOT and not boot_done:
                 cmd = 0
@@ -1543,6 +1581,7 @@ def main():
             # ---- 计算设定点 (desired_frame) ----
             desired_frame = None
             progress = 0.0
+            near_corner = False   # [v5.7] 接近拐角标志, 每帧重置, 仅在循迹分支内置位
             if task_mode == TASK_BOOT:
                 # [v5.2] BOOT 自动回中: 设定点 = 矩形中心 (类似 RECENTER)
                 # |err_x|<8 且 |err_y|<8 持续 500ms → 切 TASK_IDLE + boot_done=True
@@ -1608,6 +1647,7 @@ def main():
                 last_traj_ms = now_ms
 
                 total = traj.total_len
+                near_corner = False   # 接近拐角标志 → FLAG bit5, STM32 收到后减速防过冲
                 if total > 0 and not traj_done:
                     if traj_dwell_until > 0 and now_ms < traj_dwell_until:
                         # 拐角停留: 冻结在顶点上
@@ -1621,6 +1661,7 @@ def main():
                         # 拐角减速
                         d_corner = arc_dist_to_nearest_corner(
                             traj_arc, traj.corner_arcs, total)
+                        near_corner = (d_corner < CORNER_SLOWDOWN_ARC)  # [v5.7] 接近拐角 → 通知 STM32 减速
                         if d_corner >= CORNER_SLOWDOWN_ARC:
                             speed_scale = 1.0
                         else:
@@ -1745,8 +1786,9 @@ def main():
             # ---- 发送 ----
             if frame_id % UART_SEND_INTERVAL == 0:
                 # [v5.2] 传入 hold/boot FLAG 位 (l_lock=0 时 HOLD, task_mode=BOOT 时 BOOT)
+                # [v5.7] 传入 corner(NEAR_CORNER) 标志 → STM32 接近拐角减速
                 send_trace(uart, desired_frame, laser_frame, valid_out, traj_done,
-                           hold=hold_out, boot=boot_out)
+                           hold=hold_out, boot=boot_out, corner=near_corner)
 
             # ---- Debug 打印 ----
             if DEBUG_PRINT_INTERVAL and frame_id % DEBUG_PRINT_INTERVAL == 0:

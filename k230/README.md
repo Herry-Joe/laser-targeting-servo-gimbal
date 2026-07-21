@@ -9,7 +9,7 @@
 
 | 文件 | 说明 |
 |------|------|
-| `main.py` | **当前版本 v5.2（自包含，单文件）**：cv2 矩形角点检测 + LAB 激光检测 + 矩形周长循迹（RECENTER / TRACE_BORDER / TRACE_INNER），三通道传感器（YUV 显示 + 灰度矩形 + RGB565 激光）。**不依赖任何本地模块，部署只需拷这一个文件。** |
+| `main.py` | **当前版本 v5.7（自包含，单文件）**：cv2 矩形角点检测 + LAB 激光检测 + 矩形周长循迹（RECENTER / TRACE_BORDER / TRACE_INNER），三通道传感器（YUV 显示 + 灰度矩形 + RGB565 激光）。**不依赖任何本地模块，部署只需拷这一个文件。** |
 | `rect_detector.py` | **已弃用 / 历史**：早期"基础要求"矩形检测模块（cv2.minAreaRect 旋转框）。v5.2 已内联矩形检测逻辑，不再 import 本文件。保留作参考。 |
 | `backup/main_rect_legacy.py` | 历史版本：rect_detector 集成版 main.py（会 `from rect_detector import ...`，缺模块即 `ImportError`）|
 | `backup/main_yolo_backup.py` | 历史版本：YOLO 检测靶心（已弃用，仅作参考）|
@@ -29,7 +29,7 @@
    === K230 激光打靶追踪 ===
    ```
    若看到 `[CV] cv2 不可用`，说明固件不含 cv2，需换 daily build。
-4. 把激光对准靶面、矩形进入画面后，STM32 侧发 `k` 进入自动打靶即可（v5.2 上电为 IDLE，需 STM32 进入 AUTO/K230 模式才会开始 nulling 误差；K230 按键发的是 `0x3C 0x3C` 命令帧，当前 STM32 固件未解析，仅作视觉循迹，STM32 始终按误差帧驱动云台）。
+4. 把激光对准靶面、矩形进入画面后，STM32 侧按 **PA1** 进入矩形循迹：STM32 保持 AUTO 模式（按 K230 误差帧驱动云台），同时向 K230 发 `0x3C 0x3C [TRACE_BORDER]` 命令帧；K230 解析该命令后切到矩形循迹任务（task_id=2/3），沿矩形周长走 setpoint，并在接近四个角时置 **FLAG bit5 = NEAR_CORNER** 通知 STM32 减速防过冲。PA0 短按 = 回中 / 停止，长按 = 急停。
 
 ---
 
@@ -45,9 +45,14 @@
 
 ### 激光（红色光斑）检测
 - 主路径：cv2 HSV `inRange`（小图）做可选加速。
-- **兜底（已验证可靠）**：CanMV 原生 `img.find_blobs()` + 用户实测 **LAB 阈值**：
-  `L: 56~100 / A: 39~61 / B: 2~18`，在原图检测，坐标 ÷ 缩放比转到检测空间。
-- 实测 LAB 阈值写在 `main.py` 顶部 `RED_L_MIN/MAX` 等常量，可按现场光环境微调。
+- **兜底（已验证可靠）**：CanMV 原生 `img.find_blobs()` + **5 级渐进式 LAB 阈值表**（v5.7 新增 DIM 档，按优先级从高到低逐档放宽）：
+  1. `RED_LASER_LAB_DIM` **`(L:58~84 / A:16~37 / B:-10~9)`** — 用户实测：激光**变暗/变小**时也能捕获（优先）
+  2. `LASER_LAB_NARROW` `(L:56~100 / A:39~61 / B:2~18)` — 原默认窄范围
+  3. `LASER_LAB_CENTER` 中范围
+  4. `LASER_LAB_WIDE` 宽范围
+  5. `LASER_LAB_HOT` 热区兜底
+  - 激光掩膜最小像素 `LASER_MIN_PX` 由 3 降到 **2**（v5.7），激光变小也识别。
+- 实测 LAB 阈值写在 `main.py` 顶部 `RED_L_*/RED_A_*/RED_B_*` 等常量，可按现场光环境微调。
 
 ### 矩形检测（E 题基础要求）
 
@@ -78,7 +83,7 @@
 ```
 
 - **X / Y**：靶心相对画面中心误差（像素，显示空间 800×480；正 = 靶心在中心右侧 / 下方）
-- **FLAG**：`bit0=valid`、`bit1=hit`、`bit2=hi_conf`
+- **FLAG**：`bit0=valid`、`bit1=hit`、`bit2=hi_conf`、**`bit5=near_corner`（v5.7：接近矩形拐角，请求 STM32 减速防过冲）**
 - **CRC8**：poly 0x07，覆盖 `[XH .. FLAG]`
 
 命令帧（STM32 → K230，9 字节）：`0x3C 0x3C [CMD][PARAM] ...`（预留）。
@@ -107,3 +112,15 @@ K230 REPL 会周期打印（约每 30 帧）：
 - 当前版本（cv2 小图 + 原图 find_blobs）实测约 **35fps**。
 - 若烧的是不带 cv2 的固件，会回退到 800×480 `find_rects` + `find_blobs`，帧率仅 **1~2fps**——务必使用带 OpenCV 的 CanMV daily build。
 - 还觉得慢：可关 `to_ide=True`、或把 `DETECT_W/DETECT_H` 从 320×240 降到 160×120。
+
+---
+
+## 七、更新记录
+
+- **v5.7（矩形循迹 / 抗过冲 / 抗亮度变化）**
+  - **激光抗亮度变化**：LAB 阈值表升级为 5 级渐进式，新增 `RED_LASER_LAB_DIM (58,84,16,37,-10,9)` 作为最高优先级档，激光变暗/变小时优先捕获；`LASER_MIN_PX` 3→2。
+  - **抗矩形识别小概率失误**：`RECT_HOLD_FRAMES` 5→6（检测丢失时保持上一框并外推）；`DETECT_INTERVAL` 2→3（矩形检测降频，让出算力给激光检测与串口传输，整体识别/传输频率更高、视觉闭环更流畅）。
+  - **K230 解析 STM32 命令帧**：新增 `parse_host_command()`，识别 `0x3C 0x3C [CMD]`，响应 `TRACE_BORDER/TRACE_INNER/RECENTER/STOP/AIM`（PA1/PA0 按键驱动）。
+  - **接近拐角减速**：循迹 setpoint 走到四个角附近（`d_corner < CORNER_SLOWDOWN_ARC`）时置 **FLAG bit5 = NEAR_CORNER**，通知 STM32 降速防过冲；直线段保持原速（提速）。
+  - 通信坐标帧仍 `0x3C 0x3B ...`，FLAG 新增 bit5。
+
