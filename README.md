@@ -55,6 +55,8 @@
 | 蓝牙 TX / RX | PA2 / PA3 | USART2 @9600（JDY-31）|
 | OLED SCL / SDA | PB8 / PB9 | I2C1 重映射，地址 0x3C |
 | 按键 UP/DOWN/DIR/MODE | PB12/PB13/PB14/PB15 | 内部上拉，另一端接 GND |
+| **用户按键 PA0**（功能键）| **PA0** | 内部上拉，按下=低；短按=自动打靶开关，长按(≥1.5s)=回中 |
+| **用户按键 PA1**（循迹键）| **PA1** | 内部上拉，按下=低；短按=矩形循迹开关，长按(≥1.5s)=解锁命中锁存 |
 
 ---
 
@@ -122,7 +124,9 @@ arm-none-eabi-objcopy -O ihex .pio/build/bluepill_f103c8/firmware.elf servo_gimb
 - **FLAG**：`bit0=valid`（靶心+激光有效）、`bit1=hit`（命中，误差 < 容差）、`bit2=hi_conf`（高置信）
 - **CRC8**：poly 0x07，覆盖 `[XH .. FLAG]`
 
-**命令帧（STM32 → K230，9 字节）：** `0x3C 0x3C [CMD][PARAM] ...`（预留，主要用于解锁等）。
+**命令帧（K230 → STM32，9 字节）：** K230 端按键触发，`0x3C 0x3C [CMD][PARAM] 0 0 0 0x01 0x01`。
+- `CMD`：`0x01=AIM` `0x02=RECENTER` `0x03=BORDER`(外框循迹) `0x04=INNER`(内框循迹) `0x05=STOP`
+- STM32 收到后**真正切换工作模式**：AIM/RECENTER/BORDER/INNER → 进入自动打靶（AUTO）；STOP → 停车并退回位置闭环。
 
 ### 4. 矩形帧（K230 → STM32，16 字节，新增 / E 题基础要求）
 
@@ -172,6 +176,23 @@ arm-none-eabi-objcopy -O ihex .pio/build/bluepill_f103c8/firmware.elf servo_gimb
 
 **调参口诀（AUTO 速度控制器）：** 追得慢 → 提 `g p kp`；仍过冲 → 调大减速区 `g p ki` 或加阻尼 `g p kd`。
 
+### 硬件按键控制（PA0 / PA1，板载独立按键）
+
+当串口/上位机控制偶发不可靠时，PA0/PA1 提供确定的硬件控制（上拉输入，按下=低电平）：
+
+| 按键 | 短按 | 长按（按住 ≥1.5s）|
+|------|------|------|
+| **PA0（功能键）** | 自动打靶 **开 / 关**（AUTO ↔ POSCTRL）| **回中**：目标清零 + 释放命中锁存 + PID 复位 |
+| **PA1（循迹键）** | 矩形循迹 **开 / 关**（TRACE ↔ 停止/位置闭环）| **解锁命中锁存**（同 `u` 命令）|
+
+- 进入 AUTO 后，STM32 自动等待 K230 的有效坐标帧驱动云台；K230 命令帧（AIM/RECENTER/BORDER/INNER）也会直接切到 AUTO。
+- 手动「停止」会置 `g_auto_enabled=0`，此后即便 K230 持续发坐标帧也不会被抢占，直到再次 PA0 短按或收到新的 K230 命令帧才恢复自动打靶。
+
+### 串口功能切换说明（已修复）
+
+- **AUTO 模式下不再一刀切忽略串口命令**：仅拦截会抢占电机的手动步进命令（`p/t/c/a/s/f/h/d` 等），放行 `stop` / `m` / `u` / `home` / `trace` / `k` / `pid` / `g` / `x` / `y` 等安全控制命令，因此上位机/串口可正常在 AUTO 下切换功能。
+- K230 命令帧（AIM/RECENTER/BORDER/INNER/STOP）现在**真正切换 `g_gimbal_mode`**，不再只是更新任务 ID。
+
 ---
 
 ## 七、关键参数（`stm32_servo_gimbal/src/main.c`）
@@ -184,6 +205,8 @@ arm-none-eabi-objcopy -O ihex .pio/build/bluepill_f103c8/firmware.elf servo_gimb
 | PAN_MAX_STEPS / TILT_MAX_STEPS | 400 / 300 | 软限位 ±40° / ±30° |
 | POS_LIMIT Pan / Tilt | ±1350 / ±800 步 | 物理限位 ±135° / ±80°（S20F 行程）|
 | HIT_RELEASE_PX | 40 | 命中锁存后误差超此值才重新捕获 |
+| 速度指令 EMA（加速度限幅）| 0.55/0.45 | 平滑速度变化，抑制矩形拐角处方向突变导致的过冲 |
+| 循迹降速系数 | 0.7× | BORDER/INNER 任务时降低最高速度，让激光更贴线、减少冲出线外 |
 
 ---
 
