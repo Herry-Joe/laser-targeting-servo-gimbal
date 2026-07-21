@@ -25,9 +25,11 @@
 #        - 激光点用红色十字标记
 #        - 当前设定点 (循迹目标) 用蓝色十字标记
 #   3. 原点 = A4 纸中心 = 检测到的矩形几何中心 (proc 坐标).
-#      Task1 (RECENTER): 设定点 = 矩形中心 → 误差 = 中心 - 激光 → 对中.
-#      Task2 (TRACE_BORDER): 设定点沿"外框"周长走 (用 cv2 检测的角点).
-#      Task3 (TRACE_INNER): 设定点沿"内框"周长走 (外框四角向中心缩 15%).
+#      Task1 (RECENTER): 设定点 = 内框(胶带)中心 → 误差 = 中心 - 激光 → 对中.
+#      Task2 (TRACE_BORDER): 设定点沿"外框"周长走. 外框 = 画面边缘内缩 5% 的
+#            固定轴对齐矩形 (每边只动一个轴, 更快更准, 四点定位即可).
+#      Task3 (TRACE_INNER): 设定点沿"内框"周长走. 内框 = 视觉四点定位检测到的
+#            电工胶带矩形 (黑胶带贴白 A4 纸).
 #   4. 视觉闭环: 误差 = 设定点 - 激光, 通过 UART 发给 STM32 PID 云台,
 #      STM32 nulling 误差 → 激光跟随设定点移动 → 自动画出矩形.
 #
@@ -143,14 +145,18 @@ TRACE_ENABLE = True
 # TRACE_REFERENCE = "laser": 误差 = 设定点 - 激光 (视觉闭环)
 #                    "center": 误差 = 设定点 - 画面中心 (无激光时)
 TRACE_REFERENCE = "laser"
-TRACE_SPEED = 40.0           # 周长行走速度 (proc px/s)
+TRACE_SPEED = 40.0           # 内框(胶带)周长行走速度 (proc px/s)
 TRACE_LOOP  = "repeat"        # "once" 走一圈停 / "repeat" 循环 / "pingpong" 往返
 TRACE_DIR   = 1               # 行走方向 +1 / -1
 TRACE_SAMPLE_SPACING = 3.0    # 周长密集采样间距 (proc px)
 TRACE_LOCK  = True            # 锁定后不重建轨迹 (除非边框漂移)
 TRACE_REBUILD_DRIFT = 0.12    # 中心移动超过此比例才重建轨迹
-# 内框缩放系数 (Task3: 外框四角向中心缩 INNER_INSET_RATIO)
-INNER_INSET_RATIO = 0.15      # 15% → 内框是外框的 70% (两边各缩 15%)
+# ----- 外矩形 (固定) / 内矩形 (视觉检测) -----
+# 外矩形 = 画面边缘向内收缩 OUTER_INSET_RATIO, 轴对齐 (不依赖视觉检测).
+#   循迹外框时每边只动一个轴 (Pan 或 Tilt 单轴), 更快更准, 用四点定位即可.
+# 内矩形 = 电工胶带围成的矩形边框 (黑胶带贴白 A4 纸), 由视觉四点定位检测.
+OUTER_INSET_RATIO = 0.05      # 外矩形内缩比例 (5%)
+OUTER_TRACE_SPEED = 80.0      # 外框循迹速度 (固定轴对齐, 可更激进, proc px/s)
 
 # 拐角处理 (让激光在 90° 拐角处不"切角")
 CORNER_SLOWDOWN_ARC       = 25.0   # 拐角附近减速弧长 (proc px)
@@ -245,7 +251,7 @@ _TUNE_BOUNDS = {
     "track_w": (0.0, 3.0), "use_cv2": (0, 1),
     "bin": (0, 1), "bin_lo": (0, 254), "bin_hi": (1, 255),
     "snap_a": (0.05, 1.0), "move_px": (0.0, 20.0), "hold_f": (0, 30),
-    "inner_ratio": (0.05, 0.45),
+    "outer_speed": (5.0, 200.0),
     "trace_speed": (5.0, 200.0),
 }
 # 默认值快照 (删 .conf → 恢复)
@@ -260,7 +266,7 @@ _TUNE_DEFAULTS = {
     "bin": RECT_BINARIZE, "bin_lo": BINARY_LO, "bin_hi": BINARY_HI,
     "snap_a": RECT_SNAP_ALPHA, "move_px": RECT_MOVE_PX_PER_FRAME,
     "hold_f": RECT_HOLD_FRAMES,
-    "inner_ratio": INNER_INSET_RATIO,
+    "outer_speed": OUTER_TRACE_SPEED,
     "trace_speed": TRACE_SPEED,
 }
 
@@ -376,7 +382,7 @@ def load_tune_config():
         LASER_INTERVAL, LASER_GLOBAL_SWEEP_INTERVAL, OSD_X_OFFSET, OSD_Y_OFFSET, \
         RECT_TRACK_WEIGHT, USE_CV2, RECT_BINARIZE, BINARY_LO, BINARY_HI, \
         RECT_SNAP_ALPHA, RECT_MOVE_PX_PER_FRAME, RECT_HOLD_FRAMES, \
-        INNER_INSET_RATIO, TRACE_SPEED
+        OUTER_TRACE_SPEED, TRACE_SPEED
 
     if not STATUS_FILES_ENABLE:
         return
@@ -407,7 +413,7 @@ def load_tune_config():
                     num = float(val)
                     if num.is_integer() and key not in (
                         "reg_w", "reg_aspect", "approx_eps", "track_w",
-                        "snap_a", "move_px", "inner_ratio", "trace_speed"
+                        "snap_a", "move_px", "outer_speed", "trace_speed"
                     ):
                         num = int(num)
                 except BaseException:
@@ -440,7 +446,7 @@ def load_tune_config():
     RECT_BINARIZE = bool(int(applied.get("bin", RECT_BINARIZE)))
     BINARY_LO = int(applied.get("bin_lo", BINARY_LO))
     BINARY_HI = int(applied.get("bin_hi", BINARY_HI))
-    INNER_INSET_RATIO = float(applied.get("inner_ratio", INNER_INSET_RATIO))
+    OUTER_TRACE_SPEED = float(applied.get("outer_speed", OUTER_TRACE_SPEED))
     TRACE_SPEED = float(applied.get("trace_speed", TRACE_SPEED))
     if "use_cv2" in applied:
         USE_CV2 = bool(int(applied["use_cv2"]))
@@ -452,14 +458,14 @@ def load_tune_config():
         "canny1={} canny2={} rect_thresh={} reg_w={} reg_aspect={} detect={} "
         "approx_eps={} laser_int={} laser_sweep={} osd=({},{}) "
         "track_w={} use_cv2={} bin={} bin_lo={} bin_hi={} snap_a={} move_px={} "
-        "hold_f={} inner_ratio={} trace_speed={}".format(
+        "hold_f={} outer_speed={} trace_speed={}".format(
             CANNY_THRESH1, CANNY_THRESH2, RECT_THRESHOLD,
             RECT_REGULARITY_WEIGHT, RECT_TARGET_ASPECT, DETECT_INTERVAL,
             APPROX_EPSILON, LASER_INTERVAL, LASER_GLOBAL_SWEEP_INTERVAL,
             OSD_X_OFFSET, OSD_Y_OFFSET, RECT_TRACK_WEIGHT, USE_CV2,
             RECT_BINARIZE, BINARY_LO, BINARY_HI, RECT_SNAP_ALPHA,
             RECT_MOVE_PX_PER_FRAME, RECT_HOLD_FRAMES,
-            INNER_INSET_RATIO, TRACE_SPEED,
+            OUTER_TRACE_SPEED, TRACE_SPEED,
         ),
     )
 
@@ -607,7 +613,7 @@ def rect_center_of(corners):
 
 
 def inset_corners(corners, ratio):
-    """外框四角向中心缩 ratio 比例 → 内框四角 (Task3 用)."""
+    """外框四角向中心缩 ratio 比例 → 内框四角 (兼容旧调用, 当前未使用)."""
     cx, cy = rect_center_of(corners)
     out = []
     for x, y in corners:
@@ -615,6 +621,17 @@ def inset_corners(corners, ratio):
         ny = cy + (y - cy) * (1.0 - ratio)
         out.append((nx, ny))
     return out
+
+
+def fixed_outer_corners():
+    """外矩形 = 画面边缘内缩 OUTER_INSET_RATIO, 轴对齐四角
+    (顺时针: 左上→右上→右下→左下).
+    固定不变, 不依赖视觉检测; 循迹时每个边只动一个轴 (Pan 或 Tilt 单轴),
+    更快更准, 只需四点定位."""
+    m = OUTER_INSET_RATIO
+    x0 = int(round(PROC_W * m)); y0 = int(round(PROC_H * m))
+    x1 = int(round(PROC_W * (1.0 - m))); y1 = int(round(PROC_H * (1.0 - m)))
+    return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
 
 
 def choose_snap_alpha(jump, ref_size):
@@ -1285,13 +1302,17 @@ def main():
     boot_failed = False                     # BOOT 失败标志 (OSD 闪烁)
 
     # 轨迹状态 (Task2/3 用)
+    # 外矩形: 固定轴对齐四角 (画面内缩, 不参与视觉检测)
+    # 内矩形: 视觉检测到的电工胶带矩形四角 (四点定位)
+    outer_corners_proc = fixed_outer_corners()   # 外框固定四角 (proc 空间)
+    inner_corners_proc = None                    # 内框(胶带)检测四角 (proc 空间, None=未检测到)
     traj = None
-    traj_corners_proc = None       # 锁定的外框角点 (proc 空间)
-    traj_inner_corners_proc = None # 内框角点 (Task3 用, proc 空间)
-    traj_use_inner = False         # True=走内框, False=走外框
-    traj_corner_frame = None       # 外框 4 角 (frame 空间, OSD 用)
-    traj_inner_corner_frame = None # 内框 4 角 (frame 空间, OSD 用)
-    traj_center_frame = None      # 矩形中心 (frame 空间, "原点"标记)
+    traj_corners_proc = None       # 当前建轨迹用的角点 (外框固定 / 内框检测)
+    traj_use_inner = False         # True=走内框(胶带), False=走外框(固定)
+    traj_needs_build = False       # 任务切换后置 True, 待对应角点建轨迹
+    traj_corner_frame = [scale_point_to_frame(p) for p in outer_corners_proc]  # 外框(绿, 固定)
+    traj_inner_corner_frame = None # 内框(胶带)四角 (frame 空间, OSD 浅绿)
+    traj_center_frame = None      # 内框(胶带)中心 (frame 空间, "原点"黄色十字)
     traj_start_frame = None       # 起点标记
     traj_arc = 0.0
     traj_dir = TRACE_DIR
@@ -1345,7 +1366,7 @@ def main():
         camera_init()
         camera_is_init = True
         write_status("camera_ok", "camera initialized")
-        print("=== ti_cup_e_rect_trace v5.8 (cv2 + laser) start ===")
+        print("=== ti_cup_e_rect_trace v5.9 (外框固定/内框四点定位) start ===")
         print("cv2 available:", HAS_CV2)
 
         while True:
@@ -1382,20 +1403,22 @@ def main():
                 print("[TASK] → RECENTER (激光对中到 A4 中心)")
             elif cmd == K230_CMD_TRACE_BORDER:
                 task_mode = TASK_BORDER
+                traj_use_inner = False
                 traj_locked = False
                 traj = None
-                traj_use_inner = False
                 traj_done = False
                 smooth_init = False
-                print("[TASK] → TRACE_BORDER (激光绕外框一周)")
+                traj_needs_build = True   # 用固定外框四角建轨迹
+                print("[TASK] → TRACE_BORDER (激光绕外框/固定矩形一周, 单轴移动)")
             elif cmd == K230_CMD_TRACE_INNER:
                 task_mode = TASK_INNER
+                traj_use_inner = True
                 traj_locked = False
                 traj = None
-                traj_use_inner = True
                 traj_done = False
                 smooth_init = False
-                print("[TASK] → TRACE_INNER (激光绕 A4 内框一周)")
+                traj_needs_build = True   # 用视觉检测到的内框(胶带)四角建轨迹
+                print("[TASK] → TRACE_INNER (激光绕内框/电工胶带矩形一周)")
             elif cmd == K230_CMD_STOP:
                 task_mode = TASK_IDLE
                 traj_locked = False
@@ -1491,14 +1514,15 @@ def main():
                             print("laser: LOST -> entering recovery (rewind)")
                 l_last_det_ms = now_ms
 
-            # ---- 矩形检测 (自适应频率 + 角点 EMA 吸附 + 丢失保持) ----
-            run_detection = (frame_id == 1) or (not traj_locked) or rect_moving \
+            # ---- 内矩形(电工胶带)检测: 四点定位 + 角点 EMA 吸附 + 丢失保持 ----
+            # 外矩形 = 固定轴对齐 (画面内缩 OUTER_INSET_RATIO), 不参与视觉检测
+            run_detection = (frame_id == 1) or (inner_corners_proc is None) or rect_moving \
                 or (frame_id % DETECT_INTERVAL == 0)
             if run_detection and TRACE_ENABLE:
-                corners = find_rect_corners(img, traj_corners_proc)
+                corners = find_rect_corners(img, inner_corners_proc)
                 if corners is not None:
                     missed_rect = 0
-                    # 边框运动估计
+                    # 边框运动估计 (用于丢失外推)
                     rcx, rcy = rect_center_of(corners)
                     if rect_last_center is not None and rect_prev_corners is not None:
                         dframes = max(1, frame_id - rect_last_frame)
@@ -1518,90 +1542,82 @@ def main():
                     rect_last_frame = frame_id
                     rect_prev_corners = [tuple(c) for c in corners]
 
-                    if not traj_locked:
-                        # ---- 首次锁定: 建立轨迹 ----
-                        traj_corners_proc = [tuple(c) for c in corners]
-                        # 内框 = 外框向中心缩 INNER_INSET_RATIO
-                        traj_inner_corners_proc = inset_corners(
-                            traj_corners_proc, INNER_INSET_RATIO)
-                        # 选择走外框还是内框
-                        use_corners = (traj_inner_corners_proc if traj_use_inner
-                                       else traj_corners_proc)
-                        traj = RectTrajectory(use_corners, TRACE_SAMPLE_SPACING)
-                        x0 = min(p[0] for p in corners)
-                        y0 = min(p[1] for p in corners)
-                        x1 = max(p[0] for p in corners)
-                        y1 = max(p[1] for p in corners)
-                        traj_corner_frame = [scale_point_to_frame(p) for p in corners]
+                    if inner_corners_proc is None:
+                        # ---- 首次锁定内矩形 (胶带四点) ----
+                        inner_corners_proc = [tuple(c) for c in corners]
                         traj_inner_corner_frame = [
-                            scale_point_to_frame(p) for p in traj_inner_corners_proc
-                        ]
+                            scale_point_to_frame(p) for p in inner_corners_proc]
+                        x0 = min(p[0] for p in inner_corners_proc)
+                        y0 = min(p[1] for p in inner_corners_proc)
+                        x1 = max(p[0] for p in inner_corners_proc)
+                        y1 = max(p[1] for p in inner_corners_proc)
                         traj_center_frame = scale_point_to_frame(
                             ((x0 + x1) / 2.0, (y0 + y1) / 2.0))
-                        # 起点 = 离参考最近的周长点
-                        if TRACE_REFERENCE == "laser" and l_lock:
-                            ref = (lx_s, ly_s)
-                        elif recovering and last_good_laser_proc is not None:
-                            ref = last_good_laser_proc
-                        else:
-                            # 用矩形中心作起点 (从最近边的中心点出发)
-                            ref = (rcx, rcy)
-                        start_idx = traj.nearest_index(ref)
-                        traj_arc = start_idx * TRACE_SAMPLE_SPACING
-                        if not recovering:
-                            traj_dir = TRACE_DIR
-                        traj_dwell_until = 0
-                        traj_dwell_arc = 0.0
-                        traj_done = False
-                        traj_start_frame = scale_point_to_frame(
-                            traj.point_at_index(start_idx))
-                        traj_locked = True
-                        if not TRACE_LOCK:
-                            traj_locked = False
                     else:
-                        # ---- 已锁定: 角点 EMA 贴合 + 重建轨迹 ----
-                        old_c = rect_center_of(traj_corners_proc)
-                        old_w = abs(traj_corners_proc[1][0] - traj_corners_proc[0][0]) or 1
-                        old_h = abs(traj_corners_proc[2][1] - traj_corners_proc[1][1]) or 1
+                        # ---- 已锁定: 角点 EMA 贴合 ----
+                        old_c = rect_center_of(inner_corners_proc)
+                        old_w = abs(inner_corners_proc[1][0] - inner_corners_proc[0][0]) or 1
+                        old_h = abs(inner_corners_proc[2][1] - inner_corners_proc[1][1]) or 1
                         jdx = rcx - old_c[0]
                         jdy = rcy - old_c[1]
                         jump = math.sqrt(jdx * jdx + jdy * jdy)
                         alpha = choose_snap_alpha(jump, max(old_w, old_h))
-                        cur = traj.point_at_arc(traj_arc) if traj is not None else None
-                        traj_corners_proc = snap_corners_to_target(
-                            traj_corners_proc, corners, alpha)
-                        traj_inner_corners_proc = inset_corners(
-                            traj_corners_proc, INNER_INSET_RATIO)
-                        use_corners = (traj_inner_corners_proc if traj_use_inner
-                                       else traj_corners_proc)
-                        traj = RectTrajectory(use_corners, TRACE_SAMPLE_SPACING)
-                        if cur is not None:
-                            traj_arc = traj.nearest_index(cur) * TRACE_SAMPLE_SPACING
-                        traj_corner_frame = [scale_point_to_frame(p) for p in traj_corners_proc]
+                        inner_corners_proc = snap_corners_to_target(
+                            inner_corners_proc, corners, alpha)
                         traj_inner_corner_frame = [
-                            scale_point_to_frame(p) for p in traj_inner_corners_proc
-                        ]
-                        rcx2, rcy2 = rect_center_of(traj_corners_proc)
+                            scale_point_to_frame(p) for p in inner_corners_proc]
+                        rcx2, rcy2 = rect_center_of(inner_corners_proc)
                         traj_center_frame = scale_point_to_frame((rcx2, rcy2))
+                        # 若当前正循迹内框且漂移, 重建轨迹并对齐弧长
+                        if traj_use_inner and traj_locked and traj is not None:
+                            cur = traj.point_at_arc(traj_arc)
+                            traj = RectTrajectory(inner_corners_proc, TRACE_SAMPLE_SPACING)
+                            if cur is not None:
+                                traj_arc = traj.nearest_index(cur) * TRACE_SAMPLE_SPACING
                 else:
-                    # 检测丢失 → 保持上一框并外推
+                    # 检测丢失 → 保持上一内框并外推
                     missed_rect += 1
-                    if (missed_rect <= RECT_HOLD_FRAMES and traj_corners_proc is not None
+                    if (missed_rect <= RECT_HOLD_FRAMES and inner_corners_proc is not None
                             and RECT_HOLD_EXTRAPOLATE):
                         for i in range(4):
-                            traj_corners_proc[i] = (
-                                traj_corners_proc[i][0] + rect_corner_vel[i][0],
-                                traj_corners_proc[i][1] + rect_corner_vel[i][1],
+                            inner_corners_proc[i] = (
+                                inner_corners_proc[i][0] + rect_corner_vel[i][0],
+                                inner_corners_proc[i][1] + rect_corner_vel[i][1],
                             )
-                            traj_corner_frame[i] = scale_point_to_frame(
-                                traj_corners_proc[i])
-                        traj_inner_corners_proc = inset_corners(
-                            traj_corners_proc, INNER_INSET_RATIO)
-                        traj_inner_corner_frame = [
-                            scale_point_to_frame(p) for p in traj_inner_corners_proc
-                        ]
-                        rcx2, rcy2 = rect_center_of(traj_corners_proc)
+                            traj_inner_corner_frame[i] = scale_point_to_frame(
+                                inner_corners_proc[i])
+                        rcx2, rcy2 = rect_center_of(inner_corners_proc)
                         traj_center_frame = scale_point_to_frame((rcx2, rcy2))
+
+            # ---- 轨迹建立: 外框固定 / 内框视觉检测 ----
+            # 进入任务 (task_mode 改变) 时 traj_needs_build=True; 此处用对应角点建轨迹
+            if traj_needs_build and not traj_locked:
+                src = inner_corners_proc if traj_use_inner else outer_corners_proc
+                if src is not None:
+                    traj = RectTrajectory(src, TRACE_SAMPLE_SPACING)
+                    traj_corners_proc = [tuple(c) for c in src]
+                    # 起点 = 离参考最近的周长点
+                    if TRACE_REFERENCE == "laser" and l_lock:
+                        ref = (lx_s, ly_s)
+                    elif recovering and last_good_laser_proc is not None:
+                        ref = last_good_laser_proc
+                    else:
+                        rcx, rcy = rect_center_of(src)
+                        ref = (rcx, rcy)
+                    start_idx = traj.nearest_index(ref)
+                    traj_arc = start_idx * TRACE_SAMPLE_SPACING
+                    if not recovering:
+                        traj_dir = TRACE_DIR
+                    traj_dwell_until = 0
+                    traj_dwell_arc = 0.0
+                    traj_done = False
+                    traj_start_frame = scale_point_to_frame(
+                        traj.point_at_index(start_idx))
+                    traj_locked = True
+                    traj_needs_build = False
+                    print("[TRAJ] built task={} src={} corners={}".format(
+                        "BORDER" if not traj_use_inner else "INNER",
+                        "fixed" if not traj_use_inner else "detected", src))
 
             # ---- 计算设定点 (desired_frame) ----
             desired_frame = None
@@ -1672,6 +1688,8 @@ def main():
                 last_traj_ms = now_ms
 
                 total = traj.total_len
+                # 外框固定轴对齐 → 用更激进的 OUTER_TRACE_SPEED 加快; 内框(胶带)用 TRACE_SPEED
+                cur_trace_speed = OUTER_TRACE_SPEED if not traj_use_inner else TRACE_SPEED
                 near_corner = False   # 接近拐角标志 → FLAG bit5, STM32 收到后减速防过冲
                 if total > 0 and not traj_done:
                     if traj_dwell_until > 0 and now_ms < traj_dwell_until:
@@ -1693,12 +1711,12 @@ def main():
                             t = d_corner / CORNER_SLOWDOWN_ARC
                             speed_scale = CORNER_SLOW_FACTOR + \
                                           (1.0 - CORNER_SLOW_FACTOR) * t
-                        traj_arc += traj_dir * TRACE_SPEED * speed_scale * dt
+                        traj_arc += traj_dir * cur_trace_speed * speed_scale * dt
 
                         if TRACE_LOOP == "repeat":
                             # [v5.3] 绕一圈完成检测: 第一次跨过 total 边界时设置 traj_done
                             # 让 STM32 端通过 FLAG_HIT 检测任务完成, 而不是无限循环
-                            prev_arc = traj_arc - traj_dir * TRACE_SPEED * speed_scale * dt
+                            prev_arc = traj_arc - traj_dir * cur_trace_speed * speed_scale * dt
                             if traj_dir > 0 and prev_arc < total <= traj_arc + 0.5:
                                 traj_done = True
                                 print("[T2/3] loop done (arc={:.1f})".format(traj_arc))
