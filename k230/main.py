@@ -179,6 +179,9 @@ RED_LASER_LAB_USER2   = [(39, 60, 58, 79, 19, 38)]   # 用户实测 LAB 2
 # [v5.7] 用户实测阈值: 亮度偏低(激光变暗)时的红色范围 (L 58~84, A 16~37, B -10~9)
 #   L 下限比其它集更低 → 暗激光也能抓到; 作为最高优先级先行尝试.
 RED_LASER_LAB_DIM     = [(58, 84, 16, 37, -10, 9)]
+# [v5.8] 用户实测阈值: 激光落在黑色矩形上, 因背景吸光导致色域偏移(更暗/偏色)时的范围
+#   (L 25~37, A 33~62, B -5~32). 并入 DIM 级(OR), 优先捕获黑底上的暗红激光.
+RED_LASER_LAB_DIM2    = [(25, 37, 33, 62, -5, 32)]
 LASER_LAB_NARROW = ([(90, 100, -7, 23, -12, 25)] +  # 窄中心核
                     RED_LASER_LAB_USER2)
 # v5.2: 4 级渐进式 LAB 阈值表 (每级是上一级的超集)
@@ -925,7 +928,7 @@ def detect_laser(laser_img, prev_x, prev_y, pred_x, pred_y,
 
     # v5.7: 5 级渐进式 LAB 阈值表. DIM 集(L 下限更低)放最前, 优先捕获变暗的激光;
     #   后续各级是逐级放宽(超集), 直到 HOT 兜底.
-    lab_levels = (RED_LASER_LAB_DIM, LASER_LAB_NARROW, LASER_LAB_CENTER,
+    lab_levels = (RED_LASER_LAB_DIM + RED_LASER_LAB_DIM2, LASER_LAB_NARROW, LASER_LAB_CENTER,
                   LASER_LAB_WIDE, LASER_LAB_HOT)
 
     # 1) ROI 搜索 (锁定后, 在预测点附近小窗找)
@@ -983,8 +986,9 @@ def detect_laser(laser_img, prev_x, prev_y, pred_x, pred_y,
                 #   LASER_TRACK_MAX_D 内, 否则拒绝(远处反射/杂光当激光会驱动云台冲飞).
                 #   首次捕获(last_good=None)不门限, 正常选最圆 blob.
                 if last_good is not None:
-                    d = math.hypot(bx - last_good[0], by - last_good[1])
-                    if d > LASER_TRACK_MAX_D:
+                    ddx = bx - last_good[0]
+                    ddy = by - last_good[1]
+                    if (ddx * ddx + ddy * ddy) > (LASER_TRACK_MAX_D * LASER_TRACK_MAX_D):
                         return -1, -1, False
                 return bx, by, True
     return -1, -1, False
