@@ -376,6 +376,12 @@ static void K230_PID_Init(K230_PID *pid,
 #define TRACE_FLOOR_ERR_PX  25
 #define TRACE_NEAR_FLOOR    0.03f   /* [v5.10] 原0.06→0.03, 近线时几乎停转让误差归零 */
 
+/* [v5.12] 制动曲线参数 (根治"大角度冲出视野 / 刹不住车") */
+#define SEEK_VMAX       0.50f   /* 定点搜索最大速度指令: 限制到不失步范围(≈10°/s), 防一上来全速冲 */
+#define TRACE_VMAX      0.70f   /* 循迹最大速度指令: 跟随移动设定点, 比定点快但仍受限(≈15°/s) */
+#define BRAKE_DIST     160.0f   /* 制动距离(px): 从 v_max 匀减速刹停所需的剩余误差距离;
+                                   误差越大速度越接近 v_max, 误差→0 速度→0 (自然刹停, 不冲过) */
+
 /* ---- Tilt 垂直轴专用限制 (防"激光打到天上") ---- */
 /*   STEPPER_HALF_REV=4096 步 = 360°, 故 1 步 ≈ 0.088° */
 #define TILT_DEADZONE      4       /* 垂直轴死区(像素) — 收紧, 避免停在离靶心 8px 处 */
@@ -1715,6 +1721,15 @@ static float g_tilt_vel_ema = 0.0f;
  *   4. 积分抗饱和 — 输出饱和时停止积分
  *   5. Kd 降 33 倍 — D 项不再主导控制
  */
+/* [v5.12] 快速平方根(牛顿迭代 4 次, 避免链接 libm, 精度足够) */
+static float fsqrt(float x)
+{
+    if (x <= 0.0f) return 0.0f;
+    float g = x * 0.5f;
+    for (int i = 0; i < 4; i++) g = 0.5f * (g + x / g);
+    return g;
+}
+
 static void K230_ControlAxis(StepperMotor *motor, K230_PID *pid,
                               int16_t err, Kalman1D *kf,
                               uint8_t invert, const char *axis_label,
@@ -1756,36 +1771,38 @@ static void K230_ControlAxis(StepperMotor *motor, K230_PID *pid,
 
         float dir_out = invert ? -vel_out : vel_out;   /* 带符号方向正确速度指令 [-1,1] */
 
-        /* ---- 减速区: 误差越接近靶心, 速度越低, 进死区前线性归零 ----
-         *  shape = (|err| - deadzone) / (dec_zone - deadzone), 限幅 [0,1]
-         *  这是根治"过冲靶心"的关键: 速度在到达死区前已被迫降到 0.
-         *  [v5.7] 循迹时解除 dec 限幅(dec_zone 拉大), 改由速度地板控制, 实现直线提速 */
-        float dec_zone = pid->ki;                       /* ki 字段 = 减速区宽度(px) */
-        if (dec_zone <= (float)deadzone_px) dec_zone = (float)deadzone_px + 1.0f;
-        if (tracing) dec_zone = 1.0e6f;                 /* 循迹: 取消 dec 限幅 */
-        float a = (kf_err > 0.0f) ? kf_err : -kf_err;
-        float shape = (a - (float)deadzone_px) / (dec_zone - (float)deadzone_px);
-        if (shape < 0.0f) shape = 0.0f;
-        if (shape > 1.0f) shape = 1.0f;
+        /* ---- [v5.12] 制动曲线速度整形 (物理可刹停, 根治"冲出视野/刹不住") ----
+         *  旧线性 dec_zone 在接近靶心时仍给较高速度, 过冲后误差变号易反向全速冲出视野.
+         *  新方案: 速度上限由"剩余误差距离"决定 (匀减速刹停曲线):
+         *     err_eff = max(0, |err| - deadzone)
+         *     v_brake = v_max * sqrt(err_eff / BRAKE_DIST),  当 err_eff < BRAKE_DIST
+         *     v_brake = v_max,                               当 err_eff >= BRAKE_DIST (匀速段)
+         *  v_max 单独限定 (定点 SEEK_VMAX / 循迹 TRACE_VMAX), 防失步、防一上来全速冲.
+         *  误差→0 时 v_brake→0 自然刹停; 过冲(误差变号)时 v 符号随 err 翻转且幅值小→平滑反向. */
+        float a = (kf_err > 0.0f) ? kf_err : -kf_err;     /* |err| */
+        float err_eff = a - (float)deadzone_px;
+        if (err_eff < 0.0f) err_eff = 0.0f;
+        float v_max = (tracing ? TRACE_VMAX : SEEK_VMAX) * max_speed_scale;
+        float v_brake = v_max;
+        if (err_eff < BRAKE_DIST) {
+            v_brake = v_max * fsqrt(err_eff / BRAKE_DIST);
+        }
+        if (v_brake > v_max) v_brake = v_max;
 
-        /* 减速区限幅(定点锁靶用): 幅值上限 = shape, 方向保持 dir_out 符号 */
+        /* 幅值 = min(|dir_out|, v_brake), 方向保持 dir_out 符号 */
         float mag = (dir_out >= 0.0f) ? dir_out : -dir_out;
-        if (mag > shape) mag = shape;
-        mag *= max_speed_scale;                          /* 该轴最高速度(垂直轴 0.6) */
-        if (mag < 0.0f) mag = 0.0f;
-        float signed_cmd = (dir_out >= 0.0f) ? mag : -mag;  /* 重新带符号的速度指令 */
+        if (mag > v_brake) mag = v_brake;
+        float signed_cmd = (dir_out >= 0.0f) ? mag : -mag;  /* 带符号速度指令(已制动限幅) */
 
-        /* [v5.7] 矩形循迹速度整形:
-         *  - 直线段: 速度地板 = TRACE_SPEED, 提升跟随速度(画直线提速, 保证流畅)
-         *  - 接近拐角(K230 置 bit5): 地板降为 TRACE_SPEED*CORNER_FACTOR, 强减速防过冲
-         *  [v5.8] 误差相关地板: |err|<TRACE_FLOOR_ERR_PX 时地板降为 TRACE_NEAR_FLOOR,
-         *   允许误差归零, 消除恒定 0.60 地板在误差→0 时仍强推导致的极限环(抖动/偏移).
-         *  地板保留符号; err≈0 时沿用 EMA 历史方向, 避免强制单向漂移 */
+        /* [v5.7/v5.12] 矩形循迹速度地板: 保证持续跟随移动设定点.
+         *   刹车优先: 地板不超过 v_brake, 避免拐角/近线处因地板强行提速而冲出.
+         *   地板保留符号; err≈0 时沿用 EMA 历史方向, 避免强制单向漂移 */
         if (tracing) {
             float tspeed = g_k230_corner ? (TRACE_SPEED * CORNER_FACTOR) : TRACE_SPEED;
             if (abs(err) < TRACE_FLOOR_ERR_PX) {
                 tspeed = TRACE_NEAR_FLOOR;   /* 近线极小地板: 误差可归零, 激光贴线不抖 */
             }
+            if (tspeed > v_brake) tspeed = v_brake;   /* [v5.12] 刹车优先于地板 */
             float sc_mag = (signed_cmd >= 0.0f) ? signed_cmd : -signed_cmd;
             if (sc_mag < tspeed) {
                 float sgn = (signed_cmd > 0.0f) ? 1.0f
@@ -1875,8 +1892,8 @@ static void K230_ControlAxis(StepperMotor *motor, K230_PID *pid,
         int idx = (motor == &g_motor_pan) ? 0 : 1;
         if (++dbg_cnt[idx] >= 5) {
             dbg_cnt[idx] = 0;
-            printf("[%s] err=%+3d KF=%.0f → vel=%.3f shape=%.2f → %luus pos=%ld\n",
-                   axis_label, err, (double)kf_err, (double)vel_mag, (double)shape,
+            printf("[%s] err=%+3d KF=%.0f → vel=%.3f vbrake=%.2f → %luus pos=%ld\n",
+                   axis_label, err, (double)kf_err, (double)vel_mag, (double)v_brake,
                    (unsigned long)final_delay, (long)Stepper_GetPosition(motor));
         }
     } else {
@@ -2051,6 +2068,7 @@ static void K230_ProcessFrame(void)
         K230_PID_Reset(&g_pid_pan);
         K230_PID_Reset(&g_pid_tilt);
         g_kf_x.init = 0; g_kf_y.init = 0;
+        g_pan_vel_ema = 0.0f; g_tilt_vel_ema = 0.0f;   /* [v5.12] 清速度记忆, 防遗留速度导致起步冲 */
         printf("\r\n[K230] → 自动打靶 双轴控制\n");
     } else if (!g_auto_enabled) {
         /* 用户已通过 PA0/STOP 显式停用自动打靶: 即便收到坐标帧也保持冻结, 不抢占 */
