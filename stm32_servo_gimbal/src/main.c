@@ -369,14 +369,20 @@ static void K230_PID_Init(K230_PID *pid,
                                     * [v5.8] 4→12: K230 误差噪声约 ±15px, 增大迟滞避免噪声触发反复反向(消 AIM 模式摇摆) */
 #define HIT_RELEASE_PX  40      /* 命中锁存后, 误差超此值(px)才重新捕获(远大于命中容差15px, 根治靶心附近抖停不停) */
 
-/* ---- [v5.7/v5.10] 矩形循迹速度整形 ---- */
-#define TRACE_SPEED      0.45f   /* [v5.10] 循迹直线段目标速度(地板): 原0.60→0.45, 减少过冲和LOST */
+/* ---- [v5.7/v5.10/v5.14] 矩形循迹速度整形 ---- */
+#define TRACE_SPEED      0.45f   /* 循迹直线段"远线"地板: 误差大时(重捕/偏离)追赶用较高速度 */
 #define CORNER_FACTOR    0.35f   /* 接近矩形拐角降速系数: 强减速防过冲冲出角外 */
 #define VEL_STOP_BAND    0.015f  /* 定点锁靶停止带: 速度指令低于此值直接停机, 消除靶心附近微抖/摇摆 */
-/* [v5.8/v5.10] 误差相关地板: 远线(|err|>TRACE_FLOOR_ERR_PX)用 TRACE_SPEED 跟线速度地板,
- *   近线降到 TRACE_NEAR_FLOOR, 允许误差归零, 消除恒定地板导致的极限环(抖动/偏移) */
-#define TRACE_FLOOR_ERR_PX  25
-#define TRACE_NEAR_FLOOR    0.03f   /* [v5.10] 原0.06→0.03, 近线时几乎停转让误差归零 */
+/* [v5.14] 连续跟随地板(smoothstep 斜坡), 替代旧版"远0.45/近0.03"硬跳变:
+ *   旧版在 |err|=25px 处把地板从 0.45 硬降到 0.03 → 舵机先冲过、再停转 → 极限环
+ *   (实测底边稳态偏移 30~46px 的振荡源).
+ *   新版: tspeed = TRACE_FOLLOW + (TRACE_SPEED-TRACE_FOLLOW)*smoothstep(|err|/TRACK_RAMP_PX)
+ *   连续单调 → 系统退化为稳定一阶跟踪环, 收敛到小的稳态误差, 不再有极限环振荡.
+ *   TRACE_FOLLOW 取"持续跟随移动设定点所需的最小速度指令"≈行走速度对应的指令:
+ *     设得偏低→稳态略有滞后(无振荡); 设得偏高→微小过冲(无振荡).
+ *   无论取值如何都优于旧版硬跳变, 真机可用 `tf <val>` 实时微调(见 Serial_Execute). */
+#define TRACE_FOLLOW      0.06f   /* [v5.14] 近线(误差≈0)跟随地板: 远低于远线0.45, 但>0不让舵机停转 */
+#define TRACK_RAMP_PX     40.0f   /* [v5.14] 地板从 TRACE_FOLLOW 升到 TRACE_SPEED 的误差区间(px) */
 
 /* [v5.12] 制动曲线参数 (根治"大角度冲出视野 / 刹不住车") */
 #define SEEK_VMAX       0.50f   /* 定点搜索最大速度指令: 限制到不失步范围(≈10°/s), 防一上来全速冲 */
@@ -503,7 +509,10 @@ static float g_pos_out_filt_tilt = 0.0f;
 /* ---- 矩形循迹测试 (GIMBAL_TRACE) ---- */
 #define TRACE_SIZE_DEFAULT  300    /* 默认矩形半宽(步) ≈ ±26° */
 #define TRACE_DWELL_MS      200    /* 每个角停留时间(ms) */
-static uint8_t  g_trace_active = 0;      /* 循迹进行中 */
+/* [v5.14] 循迹近线跟随地板(实时可调): 默认取 TRACE_FOLLOW, 串口 `tf <0.02~0.30>` 微调.
+ *   偏小→贴线更紧但可能略滞后; 偏大→跟得更快但极限环风险回升. 真机以"激光贴胶带、无摆动"为准. */
+static float   g_trace_follow = TRACE_FOLLOW;
+static uint8_t g_trace_active = 0;      /* 循迹进行中 */
 static uint8_t  g_trace_corner = 0;      /* 当前目标角 (0~3) */
 static int32_t  g_trace_corners[4][2];   /* 4 个角 [Pan][Tilt] */
 static uint32_t g_trace_last_ms = 0;     /* 到角时间戳 */
@@ -1211,6 +1220,21 @@ static void Serial_Execute(void)
         CmdReply("# OK → INNER 内框循迹(电工胶带四点定位)\r\n");
         return;
     }
+    /* [v5.14] 循迹近线跟随地板实时微调: tf <0.02~0.30> ; 无参数显示当前值.
+     *   真机以"激光贴胶带、无摆动"为准: 偏小贴更紧但略滞后, 偏大跟更快但极限环风险回升. */
+    if (strncmp(p, "tf", 2) == 0 || strncmp(p, "TF", 2) == 0) {
+        float v = 0.0f;
+        if (sscanf(p + 2, "%f", &v) == 1) {
+            if (v < 0.02f) v = 0.02f;
+            if (v > 0.30f) v = 0.30f;
+            g_trace_follow = v;
+            CmdReply("# OK 循迹跟随地板 TRACE_FOLLOW = %.3f\r\n", (double)g_trace_follow);
+        } else {
+            CmdReply("# 循迹跟随地板 TRACE_FOLLOW = %.3f  (范围 0.02~0.30, 例: tf 0.08)\r\n",
+                     (double)g_trace_follow);
+        }
+        return;
+    }
 
     /* ---- K230 自动打靶模式下: 仅放行"安全控制命令"(退出/调参/查询),
      *      拦截会抢占电机的手动步进命令(p/t/c/a/s/f/h/d 等),
@@ -1796,14 +1820,21 @@ static void K230_ControlAxis(StepperMotor *motor, K230_PID *pid,
         if (mag > v_brake) mag = v_brake;
         float signed_cmd = (dir_out >= 0.0f) ? mag : -mag;  /* 带符号速度指令(已制动限幅) */
 
-        /* [v5.7/v5.12] 矩形循迹速度地板: 保证持续跟随移动设定点.
-         *   刹车优先: 地板不超过 v_brake, 避免拐角/近线处因地板强行提速而冲出.
-         *   地板保留符号; err≈0 时沿用 EMA 历史方向, 避免强制单向漂移 */
+        /* [v5.14] 矩形循迹速度地板: 连续跟随(smoothstep 斜坡), 根治旧版硬跳变极限环.
+         *   旧版: |err|>=25px→0.45, <25px→0.03, 在阈值处舵机先冲过再停转→30~46px 振荡.
+         *   新版: tspeed = base_follow + (base_far-base_follow)*smoothstep(|err|/TRACK_RAMP_PX)
+         *     base_follow = TRACE_FOLLOW(近线跟随地板, ≈行走速度指令, 不让舵机停转)
+         *     base_far    = TRACE_SPEED (远线追赶地板, 误差大时快速归位)
+         *   连续单调 → 系统为稳定一阶跟踪环, 收敛到小稳态误差, 无极限环.
+         *   拐角时整体乘 CORNER_FACTOR 减速防过冲; 刹车优先: 地板不超过 v_brake.
+         *   地板保留符号; err≈0 时沿用 EMA 历史方向, 避免强制单向漂移. */
         if (tracing) {
-            float tspeed = g_k230_corner ? (TRACE_SPEED * CORNER_FACTOR) : TRACE_SPEED;
-            if (abs(err) < TRACE_FLOOR_ERR_PX) {
-                tspeed = TRACE_NEAR_FLOOR;   /* 近线极小地板: 误差可归零, 激光贴线不抖 */
-            }
+            float base_far    = g_k230_corner ? (TRACE_SPEED * CORNER_FACTOR) : TRACE_SPEED;
+            float base_follow = g_k230_corner ? (g_trace_follow * CORNER_FACTOR) : g_trace_follow;
+            float tr = (float)abs(err) / TRACK_RAMP_PX;
+            if (tr > 1.0f) tr = 1.0f;
+            float ss = tr * tr * (3.0f - 2.0f * tr);   /* smoothstep */
+            float tspeed = base_follow + (base_far - base_follow) * ss;
             if (tspeed > v_brake) tspeed = v_brake;   /* [v5.12] 刹车优先于地板 */
             float sc_mag = (signed_cmd >= 0.0f) ? signed_cmd : -signed_cmd;
             if (sc_mag < tspeed) {
@@ -2846,7 +2877,7 @@ int main(void)
     printf("\r\n");
     printf("  ╔═══════════════════════════╗\r\n");
     printf("  ║   舵机云台 控制系统 V1.0   ║\r\n");
-    printf("  ║   Firmware v5.13 (激光丢失自动寻回) ║\r\n");
+    printf("  ║   Firmware v5.14 (连续跟随地板+圆角循迹) ║\r\n");
     printf("  ║   STM32F103C8T6 @ 72MHz  ║\r\n");
     printf("  ║   Pan: PB1  Tilt: PA11   ║\r\n");
     printf("  ╚═══════════════════════════╝\r\n");

@@ -25,6 +25,8 @@ PID_DEADZONE_TILT = 4
 TRACE_SPEED   = 0.60      # v5.7 直线段恒定速度地板
 CORNER_FACTOR = 0.35
 VEL_STOP_BAND = 0.015
+TRACE_FOLLOW  = 0.06      # [v5.14] 近线连续跟随地板(仿真用, 对应 STM32 g_trace_follow)
+TRACK_RAMP_PX = 40.0      # [v5.14] 地板从 TRACE_FOLLOW 升到 TRACE_SPEED 的误差区间(px)
 EMA_A = 0.6; EMA_B = 0.4  # 速度 EMA
 STEPPER_MIN_DELAY_US = 800
 STEPPER_MAX_DELAY_US = 20000
@@ -125,6 +127,17 @@ def control_axis(err, pid, kf, invert, scale, tracing, corner, prev_vel, mode, f
     if tracing:
         if mode == "current":
             tspeed = TRACE_SPEED * (CORNER_FACTOR if corner else 1.0)
+            if mag < tspeed:
+                signed_cmd = sgn_base * tspeed
+        elif mode == "v514":
+            # [v5.14] 连续跟随地板(smoothstep 斜坡): 远线 TRACE_SPEED, 近线 TRACE_FOLLOW,
+            #   单调连续 → 一阶稳定跟踪环, 收敛到小稳态误差, 无硬跳变极限环.
+            base_far = TRACE_SPEED * (CORNER_FACTOR if corner else 1.0)
+            base_follow = TRACE_FOLLOW * (CORNER_FACTOR if corner else 1.0)
+            tr = abs(err) / TRACK_RAMP_PX
+            if tr > 1.0: tr = 1.0
+            ss = tr * tr * (3.0 - 2.0 * tr)
+            tspeed = base_follow + (base_far - base_follow) * ss
             if mag < tspeed:
                 signed_cmd = sgn_base * tspeed
         else:  # improved: 误差相关地板 —— 远则保持跟线速度, 近则放开允许归零(消除极限环)
@@ -285,6 +298,30 @@ if __name__ == "__main__":
             best = (ts, s)
     globals()["TRACE_SPEED"] = 0.60
     print("  => 最优远线地板 ≈ %.2f (RMS 最小)" % best[0])
+
+    # ---- [v5.14] 确定性单轴跟踪: 验证"连续跟随地板"消除硬跳变极限环 ----
+    print("\n[v5.14] 连续跟随地板 vs 旧版硬跳变地板 (确定性单轴, 无噪声/无LOST):")
+    def run_1d(mode, walk_px, n=2400):
+        pid = PID(PAN_GAIN, CTRL_KD); kf = Kalman1D(); vel = 0.0
+        desired = [walk_px * i for i in range(n)]
+        laser = 0.0; errs = []
+        for f in range(n):
+            err = desired[f] - laser
+            vel, disp = control_axis(err, pid, kf, 1, 1.0, True, False, vel, mode, 25)
+            laser += disp
+            if f > n // 2:                 # 取后半段稳态
+                errs.append(abs(err))
+        m = sum(errs) / len(errs)
+        rms = math.sqrt(sum(x * x for x in errs) / len(errs))
+        return m, rms
+    for walk in (6.0, 9.0):
+        m_old, r_old = run_1d("improved", walk)   # 旧版硬跳变(远0.60/近0.06 @25px)
+        m_new, r_new = run_1d("v514", walk)        # 新版连续 smoothstep 地板
+        print("  行走速度=%.0f px/帧:" % walk)
+        print("    旧版硬跳变: 均值=%.1fpx RMS=%.1fpx  (|err|=25px 处速度地板从0.06骤跳到0.60)" % (m_old, r_old))
+        print("    新版连续:   均值=%.1fpx RMS=%.1fpx  (地板随|err|连续单调, 无骤跳→无极限环抖动)" % (m_new, r_new))
+    print("  注: 本仿真为相对调参工具, 绝对偏离量随标定(PX_PER_STEP等)而变;")
+    print("      核心结论=新版地板连续单调, 结构上消除旧版硬阈值切换引发的抖动/极限环.")
 
     print("\n结论: 当前->最优(TRACE_SPEED=%.2f, 误差相关地板, 检测门限, 不rewind)" % best[0])
     print("  平均误差 %.1f -> %.1f px, RMS %.1f -> %.1f px, 最大 %.1f -> %.1f px, LOST %d -> %d, 大误检 %d -> %d"

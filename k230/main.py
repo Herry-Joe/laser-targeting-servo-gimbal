@@ -130,6 +130,11 @@ RECT_REGULARITY_WEIGHT = 0.05
 RECT_BINARIZE = True
 BINARY_LO = 0
 BINARY_HI = 110
+# [v5.14] 自适应阈值(高斯)替代固定阈值110: 光照变化/胶带反光的场地也能稳定抠出黑胶带边框,
+#   不再因固定阈值偏高而丢框(丢框→外推/重捕→中断"一次跑通"). 自适应无候选时回退固定阈值.
+RECT_ADAPTIVE = True
+RECT_ADAPT_BLOCK = 11          # 自适应窗口(奇数, px)
+RECT_ADAPT_C = 12              # 自适应偏移: 局部均值减去此值作为阈值(胶带比背景暗→入前景)
 # 时间一致性权重 (抗误切换/抗丢帧): v5.1 0.2→0.4 (增强时序稳定性, 减少误切换)
 RECT_TRACK_WEIGHT = 0.4
 # 矩形边缘留白 (px): 矩形触碰画面边缘时视为不完整 → 拒识
@@ -145,10 +150,11 @@ TRACE_ENABLE = True
 # TRACE_REFERENCE = "laser": 误差 = 设定点 - 激光 (视觉闭环)
 #                    "center": 误差 = 设定点 - 画面中心 (无激光时)
 TRACE_REFERENCE = "laser"
-TRACE_SPEED = 40.0           # 内框(胶带)周长行走速度 (proc px/s)
+TRACE_SPEED = 30.0           # [v5.14] 内框(胶带)周长行走速度 (proc px/s): 原40→30, 更贴线、偏离更小
 TRACE_LOOP  = "repeat"        # "once" 走一圈停 / "repeat" 循环 / "pingpong" 往返
 TRACE_DIR   = 1               # 行走方向 +1 / -1
 TRACE_SAMPLE_SPACING = 3.0    # 周长密集采样间距 (proc px)
+CORNER_FILLET = 0.07           # [v5.14] 内框拐角倒角半径(占短边比例): 圆角 racetrack 路径消除舵机切角偏离; 0=尖角
 TRACE_LOCK  = True            # 锁定后不重建轨迹 (除非边框漂移)
 TRACE_REBUILD_DRIFT = 0.12    # 中心移动超过此比例才重建轨迹
 # ----- 外矩形 (固定) / 内矩形 (视觉检测) -----
@@ -267,6 +273,7 @@ _TUNE_BOUNDS = {
     "snap_a": (0.05, 1.0), "move_px": (0.0, 20.0), "hold_f": (0, 30),
     "outer_speed": (5.0, 150.0),
     "trace_speed": (5.0, 200.0),
+    "fillet": (0.0, 0.30),
 }
 # 默认值快照 (删 .conf → 恢复)
 _TUNE_DEFAULTS = {
@@ -282,6 +289,7 @@ _TUNE_DEFAULTS = {
     "hold_f": RECT_HOLD_FRAMES,
     "outer_speed": OUTER_TRACE_SPEED,
     "trace_speed": TRACE_SPEED,
+    "fillet": CORNER_FILLET,
 }
 
 # ----- 按键 (Pin 53) 多击状态机 -----
@@ -396,7 +404,7 @@ def load_tune_config():
         LASER_INTERVAL, LASER_GLOBAL_SWEEP_INTERVAL, OSD_X_OFFSET, OSD_Y_OFFSET, \
         RECT_TRACK_WEIGHT, USE_CV2, RECT_BINARIZE, BINARY_LO, BINARY_HI, \
         RECT_SNAP_ALPHA, RECT_MOVE_PX_PER_FRAME, RECT_HOLD_FRAMES, \
-        OUTER_TRACE_SPEED, TRACE_SPEED
+        OUTER_TRACE_SPEED, TRACE_SPEED, CORNER_FILLET
 
     if not STATUS_FILES_ENABLE:
         return
@@ -462,6 +470,7 @@ def load_tune_config():
     BINARY_HI = int(applied.get("bin_hi", BINARY_HI))
     OUTER_TRACE_SPEED = float(applied.get("outer_speed", OUTER_TRACE_SPEED))
     TRACE_SPEED = float(applied.get("trace_speed", TRACE_SPEED))
+    CORNER_FILLET = float(applied.get("fillet", CORNER_FILLET))
     if "use_cv2" in applied:
         USE_CV2 = bool(int(applied["use_cv2"]))
     if CANNY_THRESH2 <= CANNY_THRESH1:
@@ -472,14 +481,14 @@ def load_tune_config():
         "canny1={} canny2={} rect_thresh={} reg_w={} reg_aspect={} detect={} "
         "approx_eps={} laser_int={} laser_sweep={} osd=({},{}) "
         "track_w={} use_cv2={} bin={} bin_lo={} bin_hi={} snap_a={} move_px={} "
-        "hold_f={} outer_speed={} trace_speed={}".format(
+            "hold_f={} outer_speed={} trace_speed={} fillet={}".format(
             CANNY_THRESH1, CANNY_THRESH2, RECT_THRESHOLD,
             RECT_REGULARITY_WEIGHT, RECT_TARGET_ASPECT, DETECT_INTERVAL,
             APPROX_EPSILON, LASER_INTERVAL, LASER_GLOBAL_SWEEP_INTERVAL,
             OSD_X_OFFSET, OSD_Y_OFFSET, RECT_TRACK_WEIGHT, USE_CV2,
             RECT_BINARIZE, BINARY_LO, BINARY_HI, RECT_SNAP_ALPHA,
             RECT_MOVE_PX_PER_FRAME, RECT_HOLD_FRAMES,
-            OUTER_TRACE_SPEED, TRACE_SPEED,
+            OUTER_TRACE_SPEED, TRACE_SPEED, CORNER_FILLET,
         ),
     )
 
@@ -705,35 +714,117 @@ def snap_corners_to_target(locked, detected, alpha):
 
 
 class RectTrajectory:
-    """矩形周长密集采样, 让设定点按恒定弧长速度行走 (内框/胶带用)."""
+    """矩形周长采样, 拐角做圆弧倒角(fillet)→ 平滑 racetrack 路径 (内框/胶带用).
+    [v5.14] 圆角让舵机无需做不可能的 90° 瞬时转向, 从根本上消除"切角"偏离;
+            倒角半径 = CORNER_FILLET × 短边长度(夹到安全范围), 远小于胶带宽度, 路径仍贴胶带."""
 
-    def __init__(self, corners, spacing):
+    def __init__(self, corners, spacing, fillet=0.0):
         self.corners = corners
         self.spacing = spacing
+        self.fillet = fillet          # 倒角半径(像素); 0=尖角
         self.samples = []
+        self.cum = []                 # 各采样点累计弧长(用于按弧长取点)
         self.total_len = 0.0
-        self.corner_arcs = []
+        self.corner_arcs = []         # 各拐角倒角中点处的弧长(用于拐角减速判定)
         self.corner_points = []
         self._build()
 
+    @staticmethod
+    def _fillet_pts(prev, cur, nxt, r):
+        """返回 (P_in, P_out, O): 入边切点、出边切点、圆弧圆心. r<=0 或共线时 O=None."""
+        vin = (cur[0] - prev[0], cur[1] - prev[1]); vin_len = math.hypot(*vin) or 1.0
+        vout = (nxt[0] - cur[0], nxt[1] - cur[1]); vout_len = math.hypot(*vout) or 1.0
+        uin = (vin[0] / vin_len, vin[1] / vin_len)
+        uout = (vout[0] / vout_len, vout[1] / vout_len)
+        Pin = (cur[0] - uin[0] * r, cur[1] - uin[1] * r)
+        Pout = (cur[0] + uout[0] * r, cur[1] + uout[1] * r)
+        if r < 0.5:
+            return (Pin, Pout, None)
+        dx = Pout[0] - Pin[0]; dy = Pout[1] - Pin[1]
+        det = -uin[0] * uout[1] + uout[0] * uin[1]
+        if abs(det) < 1e-9:
+            return (Pin, Pout, None)
+        a = (-dx * uout[1] + uout[0] * dy) / det
+        O = (Pin[0] + a * uin[0], Pin[1] + a * uin[1])
+        return (Pin, Pout, O)
+
     def _build(self):
         self.samples = []
+        self.cum = []
         self.corner_arcs = []
         self.corner_points = []
         n = len(self.corners)
-        idx = 0
+        if n < 3:
+            return
+        # 倒角半径: 占短边比例计算, 夹到安全范围
+        edges = []
         for i in range(n):
-            x0, y0 = self.corners[i]
-            x1, y1 = self.corners[(i + 1) % n]
-            self.corner_arcs.append(idx * self.spacing)
-            self.corner_points.append((x0, y0))
-            seg_len = math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
-            steps = max(1, int(seg_len / self.spacing))
+            a = self.corners[i]; b = self.corners[(i + 1) % n]
+            edges.append(math.hypot(b[0] - a[0], b[1] - a[1]))
+        min_edge = min(edges) if edges else 1.0
+        r = self.fillet * min_edge
+        if r > 0.45 * min_edge: r = 0.45 * min_edge
+        if r < 0.0: r = 0.0
+
+        geo = []
+        for i in range(n):
+            geo.append(self._fillet_pts(self.corners[(i - 1) % n],
+                                        self.corners[i],
+                                        self.corners[(i + 1) % n], r))
+
+        def dist2(a, b):
+            return math.hypot(a[0] - b[0], a[1] - b[1])
+
+        prev_pt = [None]
+        def add(pt):
+            self.samples.append(pt)
+            if prev_pt[0] is None:
+                self.cum.append(0.0)
+            else:
+                self.cum.append(self.cum[-1] + dist2(pt, prev_pt[0]))
+            prev_pt[0] = pt
+
+        for i in range(n):
+            # 直线段: 上一拐角 Pout -> 本拐角 Pin
+            a = geo[(i - 1) % n][1]
+            b = geo[i][0]
+            seg = dist2(a, b)
+            steps = max(1, int(seg / self.spacing))
             for s in range(steps):
                 t = s / steps
-                self.samples.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
-                idx += 1
-        self.total_len = len(self.samples) * self.spacing
+                add((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
+            # 圆弧段: Pin -> Pout 绕 O (切角, 保留内侧弧度)
+            Pin_i, Pout_i, O_i = geo[i][0], geo[i][1], geo[i][2]
+            if O_i is not None and r > 0.5:
+                ang0 = math.atan2(Pin_i[1] - O_i[1], Pin_i[0] - O_i[0])
+                ang1 = math.atan2(Pout_i[1] - O_i[1], Pout_i[0] - O_i[0])
+                d1 = ang1 - ang0
+                while d1 > math.pi: d1 -= 2 * math.pi
+                while d1 < -math.pi: d1 += 2 * math.pi
+                # 选"更靠近角点 cur"的扫掠方向 → 倒角切向角内(贴胶带)
+                mid1 = ang0 + d1 / 2.0
+                m1 = (O_i[0] + r * math.cos(mid1), O_i[1] + r * math.sin(mid1))
+                d2 = d1 - 2 * math.pi if d1 > 0 else d1 + 2 * math.pi
+                mid2 = ang0 + d2 / 2.0
+                m2 = (O_i[0] + r * math.cos(mid2), O_i[1] + r * math.sin(mid2))
+                cur = self.corners[i]
+                sweep = d1 if dist2(m1, cur) <= dist2(m2, cur) else d2
+                arc_len = abs(sweep) * r
+                asteps = max(1, int(arc_len / self.spacing))
+                for s in range(1, asteps + 1):
+                    ang = ang0 + sweep * (s / asteps)
+                    add((O_i[0] + r * math.cos(ang), O_i[1] + r * math.sin(ang)))
+                    if s == asteps // 2:
+                        self.corner_arcs.append(self.cum[-1])
+            else:
+                add(Pout_i)
+                self.corner_arcs.append(self.cum[-1])
+            self.corner_points.append(self.corners[i])
+
+        if len(self.samples) > 1:
+            self.total_len = self.cum[-1] + dist2(self.samples[-1], self.samples[0])
+        else:
+            self.total_len = 0.0
 
     def count(self):
         return len(self.samples)
@@ -744,9 +835,15 @@ class RectTrajectory:
         return self.samples[idx % len(self.samples)]
 
     def point_at_arc(self, arc):
-        if not self.samples:
+        if not self.samples or self.total_len <= 0:
             return None
-        idx = int(arc / self.spacing) % len(self.samples)
+        a = arc % self.total_len
+        idx = 0
+        for i in range(len(self.cum)):
+            if self.cum[i] <= a:
+                idx = i
+            else:
+                break
         return self.samples[idx]
 
     def nearest_index(self, point):
@@ -1034,16 +1131,8 @@ def _approx_to_pts(approx):
     return pts
 
 
-def find_rect_corners_cv2(img, prev_corners=None):
-    """cv2 主路径: 灰度 → 二值化 → GaussianBlur → Canny → findContours
-                  → approxPolyDP(4 点) → 评分选最优."""
-    gray = img.to_numpy_ref()
-    if hasattr(gray, "ndim") and gray.ndim == 3:
-        gray = gray[:, :, 0]
-    if RECT_BINARIZE:
-        _, mask = cv2.threshold(gray, BINARY_HI, 255, cv2.THRESH_BINARY_INV)
-    else:
-        mask = gray
+def _mask_to_corners(mask, prev_corners):
+    """Canny + 轮廓 + approxPolyDP(4点) + 评分选最优 (共用, 供自适应/固定阈值复用)."""
     if GAUSSIAN_BLUR_SIZE and GAUSSIAN_BLUR_SIZE > 1:
         k = GAUSSIAN_BLUR_SIZE if GAUSSIAN_BLUR_SIZE % 2 == 1 else GAUSSIAN_BLUR_SIZE + 1
         mask = cv2.GaussianBlur(mask, (k, k), 0)
@@ -1068,6 +1157,33 @@ def find_rect_corners_cv2(img, prev_corners=None):
             continue
         cands.append(order_corners(pts))
     return choose_target_corners(cands, prev_corners)
+
+
+def find_rect_corners_cv2(img, prev_corners=None):
+    """cv2 主路径: 灰度 → 二值化 → GaussianBlur → Canny → findContours
+                  → approxPolyDP(4 点) → 评分选最优.
+    [v5.14] 自适应阈值优先: 光照变化/胶带反光场地也能稳定抠出黑胶带边框,
+            不再因固定阈值偏高而丢框(丢框→外推/重捕→中断"一次跑通").
+            自适应无候选时自动回退固定阈值(BINARY_HI), 双重保险."""
+    gray = img.to_numpy_ref()
+    if hasattr(gray, "ndim") and gray.ndim == 3:
+        gray = gray[:, :, 0]
+    if RECT_BINARIZE:
+        if RECT_ADAPTIVE:
+            block = RECT_ADAPT_BLOCK if (RECT_ADAPT_BLOCK % 2 == 1) else RECT_ADAPT_BLOCK + 1
+            mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                         cv2.THRESH_BINARY_INV, block, RECT_ADAPT_C)
+            corners = _mask_to_corners(mask, prev_corners)
+            if corners is not None:
+                return corners
+            # 自适应无候选 → 回退固定阈值
+            _, mask = cv2.threshold(gray, BINARY_HI, 255, cv2.THRESH_BINARY_INV)
+            return _mask_to_corners(mask, prev_corners)
+        else:
+            _, mask = cv2.threshold(gray, BINARY_HI, 255, cv2.THRESH_BINARY_INV)
+            return _mask_to_corners(mask, prev_corners)
+    else:
+        return _mask_to_corners(gray, prev_corners)
 
 
 def find_rect_corners(img, prev_corners=None):
@@ -1593,7 +1709,7 @@ def main():
         camera_init()
         camera_is_init = True
         write_status("camera_ok", "camera initialized")
-        print("=== ti_cup_e_rect_trace v5.13 (激光丢失自动寻回+防漂移) start ===")
+        print("=== ti_cup_e_rect_trace v5.14 (圆角循迹+连续跟随地板+自适应检测) start ===")
         print("cv2 available:", HAS_CV2)
 
         while True:
@@ -1888,7 +2004,7 @@ def main():
                 else:
                     # 内框 → RectTrajectory 密集采样 (允许倾斜)
                     if inner_corners_proc is not None:
-                        traj = RectTrajectory(inner_corners_proc, TRACE_SAMPLE_SPACING)
+                        traj = RectTrajectory(inner_corners_proc, TRACE_SAMPLE_SPACING, CORNER_FILLET)
                         traj_corners_proc = [tuple(c) for c in inner_corners_proc]
                         if TRACE_REFERENCE == "laser" and l_lock:
                             ref = (lx_s, ly_s)
