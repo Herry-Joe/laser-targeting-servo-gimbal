@@ -1,8 +1,13 @@
-# 舵机二维云台改造方案（带滑环）
+# 无刷电机二维云台改造方案（WHEELTEC F32C）
 
 > 原方案：双轴 ULN2003 + 28BYJ-48 步进电机（Pan 水平 + Tilt 俯仰），K230 视觉闭环激光打靶。
-> 新方案：双轴 270° 标准舵机 + 空心滑环，STM32F103C8T6 用 50Hz PWM 驱动（**PB1=TIM3_CH4=Pan**，**PA11=TIM1_CH4=Tilt**）。
-> 固件已编译通过，产物 `servo_gimbal.hex`（Flash 77.2% / RAM 22.9%）。
+> 中间方案：双轴 270° 标准舵机 + 空心滑环，STM32F103C8T6 用 50Hz PWM 驱动（PB1=TIM3_CH4=Pan，PA11=TIM1_CH4=Tilt）。
+> **本次方案（当前）**：WHEELTEC F32C 二自由度无刷电机云台，自带驱动板、走 TTL 串口速度闭环协议，
+>   MCU 用 **USART3 硬件串口（PB10 TX）→ 驱动板 RXD** 发速度指令（ID1=Pan，ID2=Tilt），115200/8N1。
+> 上层 K230 视觉闭环、速度控制器、位置 PID、虚拟步进模型**全部不变**，仅替换最底层执行机构。
+> **[v6.0 串口重分配]** K230 视觉从原 USART3 迁到 **USART2（PA2/PA3）**；空出的 USART3 改接无刷云台；
+>   蓝牙（JDY-31）整体移除，命令/遥测统一走调试串口 **USART1（PA9/PA10）**。
+> 固件改动后需重新编译，产物 `servo_gimbal.hex`。
 
 ---
 
@@ -32,17 +37,20 @@
 
 | 信号 | 原（步进） | 现（舵机） | 备注 |
 |---|---|---|---|
-| PA4 / PA5 | Pan IN1 / IN2 | 释放 | 悬空 |
-| **PB1** | （原未用） | **TIM3_CH4 → Pan 舵机 PWM** | 复用推挽 |
-| **PA11** | （原未用） | **TIM1_CH4 → Tilt 舵机 PWM** | 复用推挽 |
+| PA4 | Pan IN1（早期步进） | 释放（无刷云台改走 USART3 硬件串口，不再用 PA4 软串口） | 悬空 |
+| PA5 | Pan IN2（早期步进） | 释放 | 悬空 |
+| PB1 | TIM3_CH4 → Pan 舵机 PWM | 释放 | 无刷方案不再作 PWM |
+| PA11 | TIM1_CH4 → Tilt 舵机 PWM | 释放 | 无刷方案不再作 PWM |
 | PB3~PB6 | Tilt IN1~IN4 | 释放 | PB3/PB4 已 NOJTAG 释放 |
 | TIM2 | Pan 步进节拍 | Pan 步进节拍（不变） | Update 中断推进 pos_steps |
-| **TIM3** | （原未用） | **50Hz PWM（Pan，PB1=TIM3_CH4）** | 仅 PWM，无节拍中断 |
-| **TIM1** | （原未用） | **50Hz PWM（Tilt，PA11=TIM1_CH4）** | 仅 PWM，无节拍中断 |
-| **TIM4** | 未用 | **Tilt 步进节拍（新增）** | Update 中断推进 pos_steps |
+| **TIM3** | 50Hz PWM（Pan） | **弃用（空函数）** | 无刷云台改用 USART3 硬件串口，不再需要位时钟 |
+| **TIM1** | 50Hz PWM（Tilt） | **弃用（空函数）** | 无刷方案不写 PWM |
+| **TIM4** | Tilt 步进节拍 | Tilt 步进节拍（不变） | Update 中断推进 pos_steps |
 
 > 关键设计：保留原"虚拟步进"模型（pos_steps，单位 0.1°）和全部已调好的 PID / 位置闭环算法，
-> 仅把最底层"GPIO 步进序列"换成"TIM3 PWM 角度映射"。因此追踪/定位逻辑零改动、风险最小。
+> 仅把最底层"舵机 PWM 角度映射"换成"无刷速度串口指令"。因此追踪/定位逻辑零改动、风险最小。
+> STM32F103 共 3 个硬件串口：USART1(调试/PC)、USART2(K230 视觉)、USART3(无刷云台)。
+> 蓝牙（JDY-31）于 v6.0 移除；K230 由 USART3 迁到 USART2 后，USART3 专用于无刷云台硬件串口。
 
 ---
 
@@ -59,10 +67,10 @@
                                                   │
         ┌──────────── 底座（定子，固定） ─────────┼────────┐
         │  STM32F103C8T6                            │        │
-        │   PA8 (TIM1_CH1) ── Pan 舵机 PWM          │        │
-        │   PA11 (TIM1_CH4) ── Tilt 舵机 PWM        │        │
+        │   PA8 / PA11 ── 释放（无刷方案不用舵机 PWM）          │        │
         │   5V / GND ──────── 滑环定子侧            │        │
-        │   USART3 (PB10/PB11) ── K230_TX/RX         │       │
+        │   USART3 (PB10) ── 无刷云台 TX → F32C RXD  │       │
+        │   USART2 (PA2/PA3) ── K230_TX/RX           │       │
         └───────────────────────────────────────────┘        │
                                                               │
                                             Tilt 舵机固定在
@@ -70,14 +78,17 @@
                                             转子侧引出
 ```
 
-走线合计（模拟 PWM 舵机方案）：`5V、GND、Pan_PWM、Tilt_PWM、K230_TX、K230_RX` = 6 线。
+走线合计（无刷方案）：`5V、GND、GIMBAL_TX(PB10)、K230_TX、K230_RX` = 5 线（云台单向 TX，不开 RX）。
 （总线舵机方案仅 `5V、GND、UART` = 3 线。）
 
 ---
 
-## 四、舵机角度映射
+## 四、角度 / 速度映射（虚拟步进模型）
 
-- 270° 标准舵机脉宽：0°→0.5ms，270°→2.5ms，中位 135°→1.5ms。
+> 无刷方案下不再有"舵机脉宽"概念：模型仍以 `pos_steps`（0.1°/步）描述位置，由 `Actuator_Update()`
+> 把模型角速度换算成指令 RPM 发给 F32C（速度闭环模式积分为位置）。下列步进节拍关系仍适用。
+
+- 270° 标准舵机脉宽：0°→0.5ms，270°→2.5ms，中位 135°→1.5ms。（历史舵机参数，无刷方案仅参考）
 - `pos_steps` 单位 **0.1°**，上电零点 = 舵机中位（135°）。
 - 脉宽计算：
   ```
@@ -90,22 +101,28 @@
 
 ---
 
-## 五、固件改动小结（已编译通过）
+## 五、固件改动小结（无刷方案）
 
+- `src/bldc_gimbal.c` / `include/bldc_gimbal.h`（**新增**）
+  - WHEELTEC F32C 协议：帧 `0x7A [ID] [CMD] [DATA...] [BCC] 0x7B`，BCC=前面字节异或，115200/8N1。
+  - 指令：使能 `0x06`、设模式 `0x00`(0=速度闭环)、设速度 `0x01`(2 字节 RPM 有符号)、读反馈 `0x0E`。
+  - USART3 硬件串口（PB10 TX），`HAL_UART_Transmit`（初始化阻塞）/ `HAL_UART_Transmit_IT`（主循环非阻塞）发帧，115200/8N1，单向 TX。
+  - `BLDCGimbal_Init()`：发 0x00 激活 → 等 1.5s 电机启动（喂 IWDG）→ 使能两轴 → 设速度模式。
+  - `BLDCGimbal_Task(pan,tilt)`：主循环调用，把 `motor->cmd_rpm` 发给电机 ID1/ID2；空闲发 0 自锁。
+  - USART3 发送由 `HAL_UART_IRQHandler` 推进 IT 传输（USART3_IRQHandler 内调用），无需 TIM3 位输出。
 - `include/stepper.h` / `src/stepper.c`
-  - 删除 4 相 GPIO 步进序列；新增 `Servo_UpdatePWM()` 把 pos_steps 映射成 TIM1 CCR 脉宽。
-  - `Stepper_Init()` 新签名：`(motor, htim_step, htim_pwm, pwm_channel, label)`。
+  - `Actuator_Update()` 替换原 `Servo_UpdatePWM()`：模型角速度(°/s = 100000/step_delay_us) × `g_motor_rpm_scale` 得指令 RPM，写入 `motor->cmd_rpm`（`DIR_CCW` 取负）。
+  - `Stepper_Init()` 签名保留 `htim_pwm / pwm_channel` 参数但**不再写 PWM CCR**（仅占位）。
   - 保留全部 `Stepper_*` 接口、状态机、WORK_MODE、软启动、限位保护；扫描到物理限位自动反向。
-  - 上电即把舵机置于中位（1500us），避免乱摆。
+  - 上电 `cmd_rpm=0` → 电机自锁保持当前角度（无刷无"中位脉宽"概念）。
 - `include/main.h`
-  - 新增 `SERVO_*` 宏（PWM 引脚/通道、脉宽、角度映射、`SERVO_STEPS_PER_DEG=10`、`SERVO_POS_MIN/MAX`）。
-  - `TIM3` 弃用，`TIM1` 作舵机 PWM；新增 `htim4` / `TIM4_Init()` 声明；`STEPPER_MIN_DELAY_US` 调为 1000。
+  - 新增 `MOTOR_RPM_PER_DEGPS=0.5f`、`BLDC_RPM_MAX=300`；`SERVO_*` 宏保留（参数仅占位）。`SOFT_UART_BAUD` 随 PA4 软串口弃用已删除。
+  - `htim3` 注释改为"保留(无刷云台改走 USART3 后未使用)"；`htim1` 注释改为"已弃用(空函数)"。
 - `src/main.c`
-  - GPIO 释放 PA4~PA7、PB0~PB7 线圈配置；`TIM1_Init()` 改为 50Hz PWM（PA8/PA11 复用推挽）。
-  - 新增 `TIM4_Init()`（Tilt 节拍）；TIM1 仅作 PWM（无 Update 中断），TIM4 作 Tilt 节拍。
-  - `Stepper_Init` 调用改为 `(&htim2,&htim3,CH4,"Pan")` / `(&htim4,&htim1,CH4,"Tilt")`。
-  - 角度换算 `PosCtrl_AngleToSteps/StepsToAngle` 改用 3600 步/圈；K230 状态帧回传真实位置。
-  - 限位 `POS_LIMIT_PAN ±1350`、回程差默认 0、丢步阈值 3000 步。
+  - `TIM1_Init()` / `TIM3_Init()` 均改为空函数（无刷云台走 USART3 硬件串口，不再需要 PWM / 位时钟）。
+  - 初始化序列插入 `BLDCGimbal_Init()`（在 `Stepper_Init` 之后、主循环之前）；删除两条舵机置中 `__HAL_TIM_SET_COMPARE`。
+  - 主循环调用 `BLDCGimbal_Task(&g_motor_pan, &g_motor_tilt)`；新增串口命令 `rpm <值>` 实时调速度比例。
+  - 角度换算 `PosCtrl_AngleToSteps/StepsToAngle` 仍用 3600 步/圈；限位 `POS_LIMIT_PAN ±1350 / TILT ±800`。
 
 ---
 
@@ -128,7 +145,8 @@ arm-none-eabi-objcopy -O ihex .pio/build/bluepill_f103c8/firmware.elf servo_gimb
 
 ## 七、上电后验证建议
 
-1. 上电看两舵机是否停在中位（激光大致朝前），无剧烈摆动。
-2. 串口发 `x30` / `y20` 等角度指令，观察 Pan/Tilt 是否平滑转到目标并自锁。
-3. 发 `k` 切 K230 自动打靶，观察追踪是否跟手（若偏慢，调小 `STEPPER_MIN_DELAY_US` 或增大位置环 Kp）。
-4. 扫描模式 `SWEEP` 应在限位间平稳往返，不卡死在端点。
+1. 上电看无刷云台是否停在当前角度（电机自锁，激光大致朝前），无剧烈摆动；调试串口应打印 `[BLDC] 无刷云台初始化完成`。
+2. 串口发 `x30` / `y20` 等角度指令，观察 Pan/Tilt 是否平滑转到目标并自锁（速度模式：指令 RPM 决定转速，停发即保持）。
+3. 若云台转动过慢/过快，发 `rpm 0.6`（或 0.3~1.0 间调整）实时改变速度比例，直到手感合适。
+4. 发 `k` 切 K230 自动打靶，观察追踪是否跟手（若偏慢，调小 `STEPPER_MIN_DELAY_US` 或增大位置环 Kp）。
+5. 扫描模式 `SWEEP` 应在限位间平稳往返，不卡死在端点。

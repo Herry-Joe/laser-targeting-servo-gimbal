@@ -56,7 +56,7 @@ typedef enum {
  *  @note  保留"虚拟步进"模型以兼容原位置闭环 PID, 仅把物理驱动从
  *         GPIO 步进序列改为 TIM3 PWM 输出。pos_steps 单位 = 0.1°。
  */
-typedef struct {
+typedef struct StepperMotor {
     StepMode    mode;               /* 占位 (舵机无步进模式概念) */
     Direction   dir;                /* 当前方向 */
     Direction   saved_dir;          /* 方向备份 (旋转后恢复用) */
@@ -83,6 +83,8 @@ typedef struct {
     uint32_t    soft_start_delay;   /* 软启动起始延迟 (比目标慢) */
     int32_t     pos_steps;          /* 绝对位置 (相对上电零点, CW 为正) — 单位 0.1° */
     int32_t     target_pos;         /* 位置闭环目标位置 (步) */
+    int16_t     cmd_rpm;            /* 当前指令转速(RPM, 有符号), 由 Actuator_Update 写入,
+                                       主循环 BLDCGimbal_Task 读取并发给无刷电机 */
     int32_t     pos_limit_min;      /* 位置下限 (步, 0 表示不限制) */
     int32_t     pos_limit_max;      /* 位置上限 (步, 0 表示不限制) */
 } StepperMotor;

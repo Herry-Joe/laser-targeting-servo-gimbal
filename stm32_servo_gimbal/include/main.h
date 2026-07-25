@@ -88,24 +88,27 @@ extern "C" {
 #define DEBUG_RX_PORT          GPIOA
 #define DEBUG_RX_PIN           GPIO_PIN_10
 
-/* ========================== 蓝牙串口 (JDY-31) ========================== */
-#define BT_USART               USART2
-#define BT_USART_BAUD          9600            /* JDY-31 默认波特率 */
-#define BT_TX_PORT             GPIOA
-#define BT_TX_PIN              GPIO_PIN_2      /* USART2 TX */
-#define BT_RX_PORT             GPIOA
-#define BT_RX_PIN              GPIO_PIN_3      /* USART2 RX */
-
-/* ========================== K230 上位机串口 (USART3, PB10/PB11) ========================== */
-#define K230_USART             USART3
+/* ========================== K230 视觉上位机串口 (USART2, PA2/PA3) ==========================
+ * [v6.0] K230 从 USART3 迁到 USART2; 蓝牙(JDY-31)已移除; 原 USART3 改接无刷云台。 */
+#define K230_USART             USART2
 #define K230_USART_BAUD        115200
-#define K230_TX_PORT           GPIOB
-#define K230_TX_PIN            GPIO_PIN_10     /* USART3 TX */
-#define K230_RX_PORT           GPIOB
-#define K230_RX_PIN            GPIO_PIN_11     /* USART3 RX */
+#define K230_TX_PORT           GPIOA
+#define K230_TX_PIN            GPIO_PIN_2      /* USART2 TX */
+#define K230_RX_PORT           GPIOA
+#define K230_RX_PIN            GPIO_PIN_3      /* USART2 RX */
+
+/* ========================== 无刷云台串口 (WHEELTEC F32C, USART3, PB10/PB11) ==========================
+ * [v6.0] 无刷云台从 PA4 软件串口(TIM3 位时钟)迁到 USART3 硬件串口, 波特率 115200。
+ *   电机 RXD ← PB10(USART3 TX); 电机 TXD → PB11(USART3 RX, 反馈可选)。 */
+#define GIMBAL_USART           USART3
+#define GIMBAL_USART_BAUD      115200
+#define GIMBAL_TX_PORT         GPIOB
+#define GIMBAL_TX_PIN          GPIO_PIN_10     /* USART3 TX → 电机 RXD */
+#define GIMBAL_RX_PORT         GPIOB
+#define GIMBAL_RX_PIN          GPIO_PIN_11     /* USART3 RX ← 电机 TXD (反馈) */
 
 /* ========================== K230 矩形识别帧 ========================== */
-/* 矩形帧 K230 → STM32 (USART3): 0x3C 0x3A [10数据][FLAGS][CRC8] 0x01 0x01
+/* 矩形帧 K230 → STM32 (USART2): 0x3C 0x3A [10数据][FLAGS][CRC8] 0x01 0x01
  * 数据(大端): CXH CXL CYH CYL WH WL HH HL ANGH ANGL
  *   CX/CY = int16 矩形中心相对靶心偏移(px)
  *   W/H   = uint16 矩形宽高(px)
@@ -174,6 +177,19 @@ extern "C" {
 #define SERVO_STEPS_PER_DEG    10
 #define SERVO_STEPS_PER_REV    3600            /* 360° / 0.1° */
 
+/* ========================== 无刷云台 (WHEELTEC F32C, USART3 硬件串口) ========================== */
+/* 速度比例: 指令 RPM = (100000 / step_delay_us) * MOTOR_RPM_PER_DEGPS
+ *   step_delay_us=800(最快) → 125°/s → 125*scale RPM
+ *   [v6.1 振荡治理] 默认由 0.5 降至 0.30: 原增益下大误差时云台冲到 ~187°/s,
+ *   而 K230 一帧仅 33ms, 云台在帧间直接冲过靶心 → 大过冲极限环("摆动控制不了")。
+ *   降比例后配合 SEEK_VMAX/BRAKE_DIST 限速, 33ms 内只移动误差一小部分, 自然刹停。
+ *   若嫌追踪偏慢, 用串口 `rpm <值>` 实时上调(范围 0.05~3.0, 例: rpm 0.4)。
+ * 单电机 RPM 上限 BLDC_RPM_MAX 作硬件保护(防撞限位)。
+ * [v6.0] 电机经 USART3(PB10/PB11, 115200) 硬件串口通信, 不再用 PA4 软件串口。 */
+#define MOTOR_RPM_PER_DEGPS  0.30f
+#define BLDC_RPM_MAX         300
+#define RPM_CLAMP(v)  (((v) > BLDC_RPM_MAX) ? BLDC_RPM_MAX : (((v) < -BLDC_RPM_MAX) ? -BLDC_RPM_MAX : (v)))
+
 /* ========================== 宏函数 ========================== */
 #define LED_ON()    HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_RESET)
 #define LED_OFF()   HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET)
@@ -195,18 +211,18 @@ void USART3_Init(void);
 void I2C1_Init(void);
 void TIM2_Init(void);
 void TIM1_Init(void);   /* Tilt 舵机 PWM 50Hz: PA11=TIM1_CH4 */
-void TIM3_Init(void);   /* Pan 舵机 PWM 50Hz: PB1=TIM3_CH4 */
+void TIM3_Init(void);   /* 保留(空函数, 无刷云台改走 USART3 后无需位时钟) */
 void TIM4_Init(void);   /* Tilt 步进节拍定时器 */
 void Error_Handler(void);
 
 /* ========================== 外设句柄 (extern) ========================== */
 extern TIM_HandleTypeDef  htim2;     /* Pan 步进节拍定时器 */
-extern TIM_HandleTypeDef  htim1;     /* Tilt 舵机 PWM 定时器 (TIM1, PA11) */
-extern TIM_HandleTypeDef  htim3;     /* Pan 舵机 PWM 定时器 (TIM3, PB1) */
+extern TIM_HandleTypeDef  htim1;     /* Tilt 舵机 PWM 定时器 (无刷方案已弃用) */
+extern TIM_HandleTypeDef  htim3;     /* 保留(无刷云台改走 USART3 硬件串口后未使用) */
 extern TIM_HandleTypeDef  htim4;     /* Tilt 步进节拍定时器 */
-extern UART_HandleTypeDef huart1;    /* 调试串口 */
-extern UART_HandleTypeDef huart2;    /* 蓝牙串口 */
-extern UART_HandleTypeDef huart3;    /* K230 上位机串口 */
+extern UART_HandleTypeDef huart1;    /* 调试/PC 控制台串口 (USART1) */
+extern UART_HandleTypeDef huart2;    /* K230 视觉上位机串口 (USART2, PA2/PA3) */
+extern UART_HandleTypeDef huart3;    /* 无刷云台串口 (WHEELTEC F32C, USART3, PB10/PB11) */
 extern I2C_HandleTypeDef  hi2c1;     /* OLED I2C 总线 */
 
 #ifdef __cplusplus

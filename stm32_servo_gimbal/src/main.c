@@ -31,6 +31,7 @@
 #include "stepper.h"
 #include "ssd1306.h"
 #include "oled_debug.h"
+#include "bldc_gimbal.h"   /* WHEELTEC F32C 无刷云台驱动 */
 #include <stdlib.h>
 #include <stdarg.h>      /* CmdReply() 需要 vsnprintf */
 #include <string.h>      /* strcmp() 实时调参命令 g 需要 */
@@ -46,23 +47,24 @@
 
 /* ========================== 全局外设句柄 ========================== */
 TIM_HandleTypeDef  htim2;       /* Pan 步进节拍定时器 */
-TIM_HandleTypeDef  htim1;       /* Tilt 舵机 PWM 定时器 (TIM1, PA11) */
-TIM_HandleTypeDef  htim3;       /* Pan 舵机 PWM 定时器 (TIM3, PB1) */
+TIM_HandleTypeDef  htim1;       /* Tilt 舵机 PWM 定时器 (无刷方案已弃用, 空函数) */
+TIM_HandleTypeDef  htim3;       /* 保留(无刷云台改走 USART3 硬件串口后未使用) */
 TIM_HandleTypeDef  htim4;       /* Tilt 步进节拍定时器 */
-UART_HandleTypeDef huart1;      /* 调试串口 */
-UART_HandleTypeDef huart2;      /* 蓝牙串口 (JDY-31) */
-UART_HandleTypeDef huart3;      /* K230 上位机串口 (PB10/PB11) */
+UART_HandleTypeDef huart1;      /* 调试/PC 控制台串口 (USART1) */
+UART_HandleTypeDef huart2;      /* K230 视觉上位机串口 (USART2, PA2/PA3) */
+UART_HandleTypeDef huart3;      /* 无刷云台串口 (WHEELTEC F32C, USART3, PB10/PB11) */
 I2C_HandleTypeDef  hi2c1;       /* OLED I2C 总线 (PB8/PB9) */
 
 /* ========================== 电机实例 ========================== */
 static StepperMotor g_motor_pan;    /* 水平电机 (Pan) */
 static StepperMotor g_motor_tilt;   /* 垂直电机 (Tilt) */
 
-/* ========================== 引脚配置表 (舵机方案) ========================== */
-/* 舵机 PWM 分两路独立定时器:
- *   Pan 舵机 : PB1 = TIM3_CH4 (50Hz)
- *   Tilt舵机 : PA11 = TIM1_CH4 (50Hz)
- * 引脚分别在 TIM3_Init() / TIM1_Init() 中配置为复用推挽。 */
+/* ========================== 引脚配置表 (无刷云台方案 v6.0) ========================== */
+/* 无刷云台 (WHEELTEC F32C) 走 TTL 串口, 自带驱动板:
+ *   MCU PB10 (USART3 TX, 硬件串口 115200) → 电机驱动板 RXD
+ *   MCU PB11 (USART3 RX) ← 电机 TXD (反馈可选)
+ * 原舵机 PWM 引脚 PB1 / PA11 在无刷方案下释放为普通 GPIO。
+ * K230 视觉(USART2, PA2/PA3) / 调试(USART1, PA9/PA10) 串口; 蓝牙已移除。 */
 
 /* ========================== 云台控制状态 ========================== */
 
@@ -94,10 +96,7 @@ static char            s_serial_buf[SERIAL_BUF_SIZE];
 static volatile uint8_t s_serial_len  = 0;
 static volatile uint8_t s_cmd_ready   = 0;
 
-/* USART2 (蓝牙) 独立缓冲 — 防止两个接口的字节交叉污染同一缓冲区 */
-static char            s_bt_buf[SERIAL_BUF_SIZE];
-static volatile uint8_t s_bt_len      = 0;
-static volatile uint8_t s_bt_cmd_ready = 0;
+/* USART2 现为 K230 视觉串口(专用解析), 无需独立缓冲; 蓝牙已移除。 */
 
 /* ========================== 命令反馈 (LED 视觉反馈) ========================== */
 static uint32_t g_feedback_until = 0;   /* LED 保持亮到此时间戳 */
@@ -126,6 +125,7 @@ static volatile int16_t         g_k230_err_y = 0;   /* Tilt 方向误差 (像素
 static volatile uint8_t         g_k230_flags = 0;   /* 标志位: bit0=valid, bit1=hit, bit2=hi_conf */
 static volatile uint8_t         g_k230_corner = 0;  /* bit5: 接近矩形拐角 → 减速防过冲 [v5.7] */
 static volatile uint8_t         g_k230_search = 0;  /* bit6: 激光丢失自动寻回中 [v5.13] */
+static uint8_t                  g_recover_active = 0;  /* [v6.2] 回中寻回激活: 激光丢失→拉回正前方(可见范围) */
 static volatile uint8_t         g_k230_frame_ready = 0;  /* 新帧到达标志 */
 static volatile uint32_t        g_k230_last_frame = 0;   /* 最后一帧时间戳(ms) */
 
@@ -146,6 +146,13 @@ static volatile uint32_t        g_k230_last_frame = 0;   /* 最后一帧时间�
 #define K230_FLAG_CORNER  0x20   /* bit5 = 接近矩形拐角 (v5.7: 请求减速防过冲) */
 #define K230_FLAG_SEARCH  0x40   /* bit6 = 激光丢失自动寻回中 (v5.13: 有界扫描) */
 
+/* [v6.2] 激光丢失回中寻回参数 — 检测到激光跑出视野时, 把云台受限拉回正前方中心,
+ *        让激光重新进入相机可见范围; 重新捕获后立即退出, 避免大幅摆动。 */
+#define RECOVER_TRIGGER_MS  300   /* 激光丢失(收到 search 标志 或 无有效帧)超过此时间 → 启动回中 */
+#define RECOVER_EXIT_MS     400   /* 重新收到有效帧(已回中/重新捕获) → 退出回中, 恢复跟踪(防轻微丢失猛拉) */
+#define RECOVER_DEADBAND    25    /* 回中死区(步, 0.1°): |pos|<此值认为已回到正前方中心 */
+#define RECOVER_DELAY_US    5000  /* 回中速度 ≈20°/s (受限, 比跟踪慢, 避免回中本身又大幅摆动) */
+
 /* K230 命令帧 CMD 值 (STM32→K230 / K230→STM32 共用) */
 #define K230_CMD_AIM        0x01
 #define K230_CMD_RECENTER   0x02
@@ -157,7 +164,11 @@ static volatile uint32_t        g_k230_last_frame = 0;   /* 最后一帧时间�
 static volatile uint8_t  g_k230_task_id     = 0;   /* 任务: 0=未知/IDLE/AIM 1=RECENTER 2=BORDER 3=INNER */
 static volatile uint8_t  g_k230_task_done   = 0;   /* 任务完成(命中锁存/稳态)标志 */
 static volatile uint8_t  g_k230_cmd_pending = 0;   /* ISR 收到的待处理命令帧 CMD (主循环消费) */
-static volatile uint8_t  g_auto_enabled     = 1;   /* 自动打靶使能(PA0 停止/K230 STOP 清0, 新命令恢复) */
+static volatile uint8_t  g_auto_enabled     = 0;   /* [v6.3] 自动打靶默认关闭: 上电后"没有发指令不要动";
+                                                        * 仅收到 AIM/RECENTER 等指令(串口或 K230 命令帧)才进入 AUTO 开始跟踪,
+                                                        * PA0 停止 / K230 STOP 仍会清 0, 新命令再恢复。 */
+static uint8_t            g_fb_damp_en       = 1;   /* [v6.10] 闭环阻尼开关: 1=用 F32C 真实角度做速度阻尼(默认开);
+                                                        * 若实测角度符号相反导致抖动, 串口 `fbdamp off` 切回模型位置阻尼。 */
 static volatile uint32_t g_k230_hold_first  = 0;   /* HOLD 连续起始时刻(0=非保持态) */
 static volatile uint32_t g_k230_steady_tick = 0;   /* 进入死区稳态起始时刻(0=未稳态) */
 
@@ -182,6 +193,11 @@ static uint8_t K230_CRC8(const uint8_t *data, uint8_t len)
 
 static volatile uint32_t g_k230_crc_err = 0;  /* CRC 校验失败计数 (调试用) */
 static volatile uint32_t g_k230_frames = 0;   /* 成功解析的坐标帧计数 (调试心跳用) */
+
+/* [v6.8] 手动点动覆盖(串口 pan/tilt 命令写入), 经 bldc_gimbal.c 发往 F32C, 不依赖 K230 */
+int16_t  g_jog_pan_rpm  = 0;
+int16_t  g_jog_tilt_rpm = 0;
+uint32_t g_jog_until    = 0;
 
 /* K230 矩形识别结果 (相对靶心原点) */
 static volatile int16_t  g_rect_dx = 0, g_rect_dy = 0;   /* 矩形中心相对靶心偏移(px) */
@@ -273,6 +289,7 @@ typedef struct {
     /* ---- 状态 ---- */
     float prev_error;         /* 上次误差 */
     float prev_measurement;   /* 上次测量值 (微分先行用) */
+    int32_t prev_pos;         /* [v6.1] 上次轴位置(步), 用于实测轴速度阻尼(轮趣级联速度内环本质) */
     uint32_t last_tick;       /* 上次更新 tick */
     uint8_t  initialized;
     uint8_t  locked;          /* 滞回锁存: 进死区后置1, 误差超 死区+迟滞 才清除(防抖) */
@@ -323,6 +340,7 @@ static void K230_PID_Reset(K230_PID *pid)
     pid->integral       = 0.0f;
     pid->prev_error     = 0.0f;
     pid->prev_measurement = 0.0f;
+    pid->prev_pos       = (int32_t)0x80000000;  /* 未初始化哨兵: 首个控制帧跳过阻尼, 防复位误触发反向 */
     pid->deriv_filtered = 0.0f;
     pid->last_tick      = HAL_GetTick();
     pid->initialized    = 1;
@@ -357,16 +375,22 @@ static void K230_PID_Init(K230_PID *pid,
  *
  *   v5.2 调整: Kp 从 1.0 降至 0.005, 让速度在 0~200px 范围内比例变化,
  *   而非"非全速即停", 配合更宽的减速区实现平滑逼近, 根治过冲振荡. */
-#define PAN_GAIN        0.005f  /* [v5.10] Pan 速度增益: 原0.006→0.005 (200px→全速), 减少大误差过冲 */
-#define PAN_DEC_ZONE    140.0f  /* [v5.10] Pan 减速区: 原120→140 (更早减速, 根治RECENTER过冲) */
-#define TILT_GAIN       0.003f  /* [v5.10] Tilt 速度增益: 原0.004→0.003 (333px→全速), 抑制Y轴±50px振荡 */
-#define TILT_DEC_ZONE   110.0f  /* [v5.10] Tilt 减速区: 原90→110 (更柔) */
-#define CTRL_KD         0.0015f /* 接近阻尼: 加大抑制过冲(原 0.0005) */
+#define PAN_GAIN        0.004f  /* [v6.1] Pan 速度增益: 0.005→0.004, 配合限速让中程更平缓, 降过冲 */
+#define PAN_DEC_ZONE    140.0f  /* [保留] 减速区(速度控制器未使用, 由 BRAKE_DIST 接管减速) */
+#define TILT_GAIN       0.0025f /* [v6.1] Tilt 速度增益: 0.003→0.0025, 抑制Y轴过冲振荡 */
+#define TILT_DEC_ZONE   110.0f  /* [保留] 减速区(速度控制器未使用) */
+#define CTRL_KD         0.0025f /* [v6.1] 接近阻尼: 0.0015→0.0025, 加大抑制过冲(对卡尔曼滤波后误差求导, 不放大噪声) */
+#define CTRL_RATE_DAMP  0.004f  /* [v6.1] 实测轴速度阻尼: 每帧位置增量(步)×此系数, 反向叠加到速度指令.
+                                    * 即轮趣级联"速度内环"本质——对真实被控量(轴运动)做阻尼, 而非仅误差求导,
+                                    * 更直接压过冲/反弹。系数小: 满速 41步/帧×0.004≈0.16 削减量, 不致拖慢跟踪。 */
 #define PID_ILIMIT      20.0f
-#define PID_DEADZONE    3       /* 死区 (像素) — Pan 轴 */
-#define PID_DEADZONE_TILT 4     /* Tilt 轴死区 */
-#define K230_HYST_PX    12      /* 滞回迟滞(px): 锁靶后误差需超 死区+此值 才重新驱动.
-                                    * [v5.8] 4→12: K230 误差噪声约 ±15px, 增大迟滞避免噪声触发反复反向(消 AIM 模式摇摆) */
+#define PID_DEADZONE    6       /* [v6.1] 死区(px) Pan: 3→6, 仍保对中精度, 抗噪声尖峰 */
+#define PID_DEADZONE_TILT 8     /* [v6.1] 死区(px) Tilt: 4→8 */
+#define K230_HYST_PX    40      /* [v6.1] 锁靶滞回迟滞(px): 12→40.
+                                    * 关键修复: K230 误差噪声约 ±15px, 原 12 使"死区+迟滞≈15px"正好被
+                                    * 噪声反复跨越 → 刚锁住就被解锁 → 持续小幅正反转抖动("摆动控制不了")。
+                                    * 现 40 使解锁门槛=死区+40≈46px, 远大于噪声峰(30px), 锁住后稳停不抖;
+                                    * 目标真移动>46px 才重新捕获, 不影响正常重捕。 */
 #define HIT_RELEASE_PX  40      /* 命中锁存后, 误差超此值(px)才重新捕获(远大于命中容差15px, 根治靶心附近抖停不停) */
 
 /* ---- [v5.7/v5.10/v5.14] 矩形循迹速度整形 ---- */
@@ -384,11 +408,13 @@ static void K230_PID_Init(K230_PID *pid,
 #define TRACE_FOLLOW      0.06f   /* [v5.14] 近线(误差≈0)跟随地板: 远低于远线0.45, 但>0不让舵机停转 */
 #define TRACK_RAMP_PX     40.0f   /* [v5.14] 地板从 TRACE_FOLLOW 升到 TRACE_SPEED 的误差区间(px) */
 
-/* [v5.12] 制动曲线参数 (根治"大角度冲出视野 / 刹不住车") */
-#define SEEK_VMAX       0.50f   /* 定点搜索最大速度指令: 限制到不失步范围(≈10°/s), 防一上来全速冲 */
-#define TRACE_VMAX      0.70f   /* 循迹最大速度指令: 跟随移动设定点, 比定点快但仍受限(≈15°/s) */
-#define BRAKE_DIST     160.0f   /* 制动距离(px): 从 v_max 匀减速刹停所需的剩余误差距离;
-                                   误差越大速度越接近 v_max, 误差→0 速度→0 (自然刹停, 不冲过) */
+/* [v6.1] 制动曲线参数 (根治"大角度冲出视野 / 刹不住车 / 极限环振荡") */
+#define SEEK_VMAX       0.30f   /* [v6.1] 定点最大速度指令: 0.50→0.30. 原增益下云台冲到~187°/s,
+                                    * K230 一帧33ms 内直接冲过靶心→大过冲极限环; 现限制到≈13°/s, 帧间
+                                    * 仅移动误差一小部分, 配合 BRAKE_DIST 自然刹停不过冲。 */
+#define TRACE_VMAX      0.45f   /* [v6.1] 循迹最大速度指令: 0.70→0.45, 跟移动设定点仍够快但不过冲 */
+#define BRAKE_DIST     60.0f    /* [v6.1] 制动距离(px): 160→60, 更早更硬减速. 误差<60px 起按
+                                    * sqrt(err_eff/60) 平滑降到 0, 近靶心速度很小, 杜绝冲过/反弹。 */
 
 /* ---- Tilt 垂直轴专用限制 (防"激光打到天上") ---- */
 /*   STEPPER_HALF_REV=4096 步 = 360°, 故 1 步 ≈ 0.088° */
@@ -524,7 +550,7 @@ static uint32_t g_pos_loststep_start = 0;
 static uint8_t  g_pos_loststep_alarm = 0;
 
 /** @brief 方向反转标志 (上电默认 Pan/Tilt 都需要反转, 解决激光正反馈跑出视野) */
-static uint8_t g_pan_dir_invert = 1;    /* 水平机械方向需反转(靶心/激光坐标系统一后实测为负反馈); 若进 AUTO 反向则发 i 翻转 */
+static uint8_t g_pan_dir_invert = 0;    /* [v6.2] 水平机械方向: 实测 AUTO 进反向, 改 0(正向反馈); 若仍反发 i 翻转 */
 static uint8_t g_tilt_dir_invert = 0;   /* 默认不反转(负反馈); 若进 AUTO 冲到限位则发 I 翻转 */
 
 /* ========================== OLED 调试显示缓冲 ========================== */
@@ -583,10 +609,11 @@ void GPIO_Init(void)
     GPIO_InitStruct.Pull  = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* ---- PA4, PA5: 未用 (舵机方案释放, 悬空输入) ---- */
-    /* ---- PA11: TIM1_CH4 (Tilt) 舵机 PWM, 在 TIM1_Init 中配置为复用推挽 ---- */
-    /* ---- PB1 : TIM3_CH4 (Pan)  舵机 PWM, 在 TIM3_Init 中配置为复用推挽 ---- */
-    /* ---- PB0~PB7: 舵机方案释放, 不再作步进驱动 (PB3/PB4 已 NOJTAG 释放) ---- */
+    /* ---- PA4: 无刷云台软件串口 TX (PA4 推挽输出, 空闲高), 在 BLDCGimbal_Init 中配置 ---- */
+    /* ---- PA5: 未用 (悬空输入) ---- */
+    /* ---- PA11: 无刷方案已释放 (不再作 Tilt 舵机 PWM) ---- */
+    /* ---- PB1 : 无刷方案已释放 (TIM3 改作软件串口位时钟, 不再作 Pan 舵机 PWM) ---- */
+    /* ---- PB0~PB7: 无刷方案释放, 不再作步进驱动 (PB3/PB4 已 NOJTAG 释放) ---- */
 
     /* ---- PB12~PB15: 按键 (上拉输入) ---- */
     GPIO_InitStruct.Pin   = GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
@@ -634,7 +661,7 @@ void USART1_Init(void)
     __HAL_UART_ENABLE_IT(&huart1, UART_IT_RXNE);
 }
 
-/* ========================== USART2 初始化 (JDY-31 蓝牙) ========================== */
+/* ========================== USART2 初始化 (K230 视觉上位机) ========================== */
 
 void USART2_Init(void)
 {
@@ -655,7 +682,7 @@ void USART2_Init(void)
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
     huart2.Instance          = USART2;
-    huart2.Init.BaudRate     = BT_USART_BAUD;      /* 9600 (JDY-31 默认) */
+    huart2.Init.BaudRate     = K230_USART_BAUD;    /* 115200 (K230 视觉上位机) */
     huart2.Init.WordLength   = UART_WORDLENGTH_8B;
     huart2.Init.StopBits     = UART_STOPBITS_1;
     huart2.Init.Parity       = UART_PARITY_NONE;
@@ -664,87 +691,18 @@ void USART2_Init(void)
     huart2.Init.OverSampling = UART_OVERSAMPLING_16;
     HAL_UART_Init(&huart2);
 
-    /* [修复] 启用 RXNE 中断, 否则蓝牙发来的命令不会被处理 */
+    /* 启用 RXNE 中断, 解析 K230 坐标/矩形/命令帧 */
     __HAL_UART_ENABLE_IT(&huart2, UART_IT_RXNE);
 }
 
-/* ========================== 蓝牙(USART2) 非阻塞发送 + 链路状态 ==========================
- * [稳定性修复 1] 原 BT_SendReport / CmdReply 用 HAL_UART_Transmit 在 9600 波特下
- *   阻塞主循环约 250ms/次 → 控制帧处理被卡 → 云台抖动/命中率下降。
- *   改: 环形缓冲 + TXE 中断续发, 主循环只负责入队, 发送在后台完成。
- *   (对应架构评审 P1-2: 蓝牙/状态发送改非阻塞)
- *
- * [v5.2] 增大缓冲区至 512, 防 150ms 高频遥测+CmdReply 并发时溢出丢包.
- *        BT_SendReport 入队前检查缓冲水位, ≥60% 满时跳帧.
- */
-#define BT_TX_RING_SIZE    512U
-static volatile uint8_t  g_bt_tx_ring[BT_TX_RING_SIZE];
-static volatile uint16_t g_bt_tx_head = 0;   /* 写指针(主循环入队) */
-static volatile uint16_t g_bt_tx_tail = 0;   /* 读指针(TXE 中断发送) */
-static volatile uint8_t  g_bt_tx_active = 0; /* 1=TXE 发送进行中 */
+/* ========================== 蓝牙 JDY-31 已移除 (v6.0) ==========================
+ * 原蓝牙非阻塞发送环形缓冲 / 链路状态 / BT_SendReport / BT_UART_* 等全部删除;
+ * K230 视觉已迁到 USART2(见 USART2_Init), 无刷云台已迁到 USART3(见 USART3_Init)。 */
 
-/* 链路状态: 用于连接可靠性指示与"重连"检测 */
-static volatile uint8_t  g_bt_connected    = 0;   /* 收到过蓝牙数据=链路活跃 */
-static volatile uint32_t g_bt_last_rx_tick = 0;   /* 最近一次收到蓝牙数据的 tick */
-#define BT_LINK_LOST_MS   8000U   /* 超过该时间未收到蓝牙数据 → 判定链路断开 */
-
-/** @brief 返回环形缓冲当前已用字节数 (线程不安全, 仅用于水位估计) */
-static uint16_t BT_RingUsed(void)
-{
-    uint16_t h = g_bt_tx_head, t = g_bt_tx_tail;
-    return (h >= t) ? (h - t) : (BT_TX_RING_SIZE - t + h);
-}
-
-/** @brief 若当前未在发送且 ring 有数据, 启动发送(写首字节+使能 TXE 中断) */
-static void BT_UART_Feed(void)
-{
-    if (g_bt_tx_active) return;
-    if (g_bt_tx_head == g_bt_tx_tail) return;   /* 空 */
-    g_bt_tx_active = 1;
-    uint8_t b = g_bt_tx_ring[g_bt_tx_tail];
-    g_bt_tx_tail = (g_bt_tx_tail + 1) % BT_TX_RING_SIZE;
-    huart2.Instance->DR = b;                     /* 触发发送, TXE 清 0 */
-    __HAL_UART_ENABLE_IT(&huart2, UART_IT_TXE);
-}
-
-/** @brief 非阻塞发送字符串(入队到环形缓冲) */
-static void BT_UART_PutStr(const char *data, int len)
-{
-    if (!HAL_IS_BIT_SET(huart2.Instance->CR1, USART_CR1_UE)) return;
-    __disable_irq();   /* 临界区: 防与 TXE ISR 竞争 ring 指针 */
-    for (int i = 0; i < len; i++) {
-        uint16_t next = (g_bt_tx_head + 1) % BT_TX_RING_SIZE;
-        if (next == g_bt_tx_tail) {
-            /* 满: 丢弃最旧一字节(覆盖), 保证最新状态能发出 */
-            g_bt_tx_tail = (g_bt_tx_tail + 1) % BT_TX_RING_SIZE;
-        }
-        g_bt_tx_ring[g_bt_tx_head] = (uint8_t)data[i];
-        g_bt_tx_head = next;
-    }
-    __enable_irq();
-    BT_UART_Feed();
-}
-
-/** @brief 链路长时间丢失后的可选恢复: 复位蓝牙模块(需硬件接 RST 引脚)
- *        默认不定义 BT_RST_PORT → 空操作; 仅清除"已连接"标志, 等待对方重连。
- *        JDY-31 为从机, 真正的重连由对端(手机/PC)发起, 固件侧只做状态管理与复位辅助。 */
-//#define BT_RST_PORT  GPIOA
-//#define BT_RST_PIN   GPIO_PIN_0
-static void BT_TryRecover(void)
-{
-#ifdef BT_RST_PORT
-    static uint32_t last_rst = 0;
-    uint32_t now = HAL_GetTick();
-    if (now - last_rst < 10000U) return;   /* 最多每 10s 复位一次, 避免抖动 */
-    last_rst = now;
-    HAL_GPIO_WritePin(BT_RST_PORT, BT_RST_PIN, GPIO_PIN_RESET);  /* 假设低有效复位 */
-    HAL_Delay(50);
-    HAL_GPIO_WritePin(BT_RST_PORT, BT_RST_PIN, GPIO_PIN_SET);
-    printf("[BT] 已复位蓝牙模块, 等待重连...\r\n");
-#endif
-}
-
-/* ========================== USART3 初始化 (K230 上位机) ========================== */
+/* ========================== USART3 初始化 (无刷云台 WHEELTEC F32C) ========================== */
+/* [v6.0] USART3 现接无刷云台: STM32(PB10 TX) → 电机 RXD, 单向发送, 不开 RX 中断。
+ *   波特率 115200, 8N1。K230 已迁到 USART2。
+ * [v6.10] 改为 TX+RX: PB11(RX) ← 电机 TXD, 用于接收 0x0E 角度反馈帧, 实现闭环控制。 */
 
 void USART3_Init(void)
 {
@@ -753,30 +711,34 @@ void USART3_Init(void)
     __HAL_RCC_USART3_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    /* PB10: USART3 TX */
+    /* PB10: USART3 TX → 电机 RXD */
     GPIO_InitStruct.Pin   = GPIO_PIN_10;
     GPIO_InitStruct.Mode  = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-    /* PB11: USART3 RX */
-    GPIO_InitStruct.Pin   = GPIO_PIN_11;
-    GPIO_InitStruct.Mode  = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull  = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
+    /* [v6.10] PB11: USART3 RX ← 电机 TXD (输入+上拉, 防悬空噪声; F1 上 USART RX 配 INPUT) */
+    GPIO_InitStruct.Pin   = GPIO_PIN_11;
+    GPIO_InitStruct.Mode  = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull  = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
     huart3.Instance          = USART3;
-    huart3.Init.BaudRate     = K230_USART_BAUD;    /* 115200 */
+    huart3.Init.BaudRate     = GIMBAL_USART_BAUD;  /* 115200 (无刷云台 TTL) */
     huart3.Init.WordLength   = UART_WORDLENGTH_8B;
     huart3.Init.StopBits     = UART_STOPBITS_1;
     huart3.Init.Parity       = UART_PARITY_NONE;
-    huart3.Init.Mode         = UART_MODE_TX_RX;
+    huart3.Init.Mode         = UART_MODE_TX_RX;     /* [v6.10] 开 RX 收角度反馈 */
     huart3.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
     huart3.Init.OverSampling = UART_OVERSAMPLING_16;
     HAL_UART_Init(&huart3);
 
-    /* 启用 RXNE 中断 */
+    /* [v6.10] 使能 RXNE 中断, 接收 F32C 9 字节反馈帧(逐字节喂 BLDCGimbal_RxByte) */
     __HAL_UART_ENABLE_IT(&huart3, UART_IT_RXNE);
+    HAL_NVIC_SetPriority(USART3_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(USART3_IRQn);
 }
 
 /* ========================== I2C1 初始化 (OLED PB8/PB9) ==========================
@@ -811,74 +773,21 @@ void TIM2_Init(void)
     HAL_NVIC_EnableIRQ(TIM2_IRQn);
 }
 
-/* ========================== TIM1 初始化 (Tilt 舵机 PWM, 50Hz) ========================== */
-/* PA11 = TIM1_CH4 (Tilt 舵机) */
+/* ========================== TIM1 初始化 (旧 Tilt 舵机 PWM, 无刷方案已弃用) ========================== */
+/* 无刷云台方案下 Tilt 不再用 TIM1 PWM, 此函数保留为空, 避免改动调用点。 */
 
 void TIM1_Init(void)
 {
-    __HAL_RCC_TIM1_CLK_ENABLE();
-
-    /* PA11 配置为 TIM1_CH4 复用推挽 (Tilt) */
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin   = SERVO_TILT_PIN;  /* PA11 */
-    GPIO_InitStruct.Mode  = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(SERVO_TILT_PORT, &GPIO_InitStruct);
-
-    /* 50Hz PWM: PSC=72-1 → 1us tick, ARR=20000-1 → 20ms 周期 */
-    htim1.Instance               = TIM1;
-    htim1.Init.Prescaler         = 72 - 1;
-    htim1.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim1.Init.Period            = 20000 - 1;
-    htim1.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
-    htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-    HAL_TIM_PWM_Init(&htim1);
-
-    TIM_OC_InitTypeDef oc = {0};
-    oc.OCMode       = TIM_OCMODE_PWM1;
-    oc.Pulse        = TILT_CENTER_US;       /* 上电中位 1500us */
-    oc.OCPolarity   = TIM_OCPOLARITY_HIGH;
-    oc.OCFastMode   = TIM_OCFAST_DISABLE;
-    HAL_TIM_PWM_ConfigChannel(&htim1, &oc, SERVO_TILT_CHANNEL);
-
-    HAL_TIM_PWM_Start(&htim1, SERVO_TILT_CHANNEL);
-
-    /* TIM1 仅作 Tilt PWM 输出, 不再用作步进节拍 (无 Update 中断) */
+    /* 无刷方案: 无操作 (PA11 保持默认输入, 不再作舵机 PWM) */
 }
 
-/* ========================== TIM3 初始化 (Pan 舵机 PWM, 50Hz) ========================== */
-/* PB1 = TIM3_CH4 (Pan 舵机) */
+/* ========================== TIM3 初始化 (保留/空函数) ========================== */
+/* [v6.0] 无刷云台改走 USART3 硬件串口后, 不再需要 TIM3 作软件串口位时钟, 故留空。
+ *   保留函数与调用点, 避免改动初始化流程; htim3 句柄保留作占位。 */
 
 void TIM3_Init(void)
 {
-    __HAL_RCC_TIM3_CLK_ENABLE();
-
-    /* PB1 配置为 TIM3_CH4 复用推挽 (Pan) */
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin   = SERVO_PAN_PIN;  /* PB1 */
-    GPIO_InitStruct.Mode  = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(SERVO_PAN_PORT, &GPIO_InitStruct);
-
-    /* 50Hz PWM: PSC=72-1 → 1us tick, ARR=20000-1 → 20ms 周期 */
-    htim3.Instance               = TIM3;
-    htim3.Init.Prescaler         = 72 - 1;
-    htim3.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim3.Init.Period            = 20000 - 1;
-    htim3.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
-    htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-    HAL_TIM_PWM_Init(&htim3);
-
-    TIM_OC_InitTypeDef oc = {0};
-    oc.OCMode       = TIM_OCMODE_PWM1;
-    oc.Pulse        = PAN_CENTER_US;       /* 上电中位 1500us */
-    oc.OCPolarity   = TIM_OCPOLARITY_HIGH;
-    oc.OCFastMode   = TIM_OCFAST_DISABLE;
-    HAL_TIM_PWM_ConfigChannel(&htim3, &oc, SERVO_PAN_CHANNEL);
-
-    HAL_TIM_PWM_Start(&htim3, SERVO_PAN_CHANNEL);
-
-    /* TIM3 仅作 Pan PWM 输出 */
+    /* 无刷方案: 无操作 (TIM3 不再使用) */
 }
 
 /* ========================== TIM4 初始化 (Tilt 电机步进节拍) ========================== */
@@ -910,7 +819,7 @@ static void NVIC_Config(void)
     HAL_NVIC_SetPriority(USART1_IRQn, 0, 0);
     HAL_NVIC_EnableIRQ(USART1_IRQn);
 
-    /* USART2 中断 (蓝牙) */
+    /* USART2 中断 (K230) */
     HAL_NVIC_SetPriority(USART2_IRQn, 0, 0);
     HAL_NVIC_EnableIRQ(USART2_IRQn);
 
@@ -935,8 +844,8 @@ int _write(int fd, char *ptr, int len)
     return len;
 }
 
-/* 命令回显: 仅发蓝牙(USART2), 不污染 K230 接收缓冲.
- * 供 Serial_Execute() 的命令响应使用 (printf 已改为仅 USART1). */
+/* 命令回显: 发往 USART1(PC 控制台). printf 已改为仅 USART1; 此处用阻塞发送
+ * 命令回复, 不再依赖已删除的蓝牙端口, 也不污染 K230(USART2) 接收缓冲. */
 static void CmdReply(const char *fmt, ...)
 {
     static char buf[128];
@@ -945,7 +854,7 @@ static void CmdReply(const char *fmt, ...)
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     if (n > 0) {
-        BT_UART_PutStr(buf, n);   /* 非阻塞(环形缓冲+TXE中断), 不阻塞主循环 */
+        HAL_UART_Transmit(&huart1, (uint8_t *)buf, (uint16_t)n, 10);
     }
 }
 
@@ -991,6 +900,7 @@ static void PrintHelp(void)
     printf("  ║ [PID 调参]                                ║\r\n");
     printf("  ║   pid p/t kp/ki/kd <值>  位置环调参       ║\r\n");
     printf("  ║   g p/t kp/ki/kd <值>    K230 追踪调参    ║\r\n");
+    printf("  ║   rpm <0.05~3.0> 无刷速度比例(实时) ║\r\n");
     printf("  ║                                         ║\r\n");
     printf("  ╠══════════════════════════════════════════╣\r\n");
     printf("  ║ [信息]                                   ║\r\n");
@@ -1126,9 +1036,14 @@ static void Serial_Execute(void)
         return;
     }
     if (*p == 'k' || *p == 'K') {
+        /* [v6.7 修复] 必须同时置 g_auto_enabled=1! 否则 K230_ProcessFrame 内的
+         * `else if (!g_auto_enabled) return` 会直接冻结云台, 出现"切到 AUTO 模式却
+         * 完全不动"。g_auto_enabled 才是 AUTO 实际使能的唯一真值(PA0/PA1 与
+         * TriggerK230Task 都置它); 旧代码只置 mode 漏了它, 是"发指令不动"的真凶。 */
+        g_auto_enabled = 1;
         g_gimbal_mode = GIMBAL_AUTO;
         g_feedback_until = HAL_GetTick() + 150;
-        CmdReply("# OK 切换到 K230 自动打靶模式\r\n");
+        CmdReply("# OK 切换到 K230 自动打靶模式 (auto_enabled=1, 云台开始跟随 K230)\r\n");
         return;
     }
     if (*p == 'm' || *p == 'M') {
@@ -1199,6 +1114,70 @@ static void Serial_Execute(void)
         return;
     }
 
+    /* ---- [v6.8] 电机自检 / 手动点动: 直接验证 F32C 是否响应, 不依赖 K230 ---- */
+    if (*p == 't' || *p == 'T') {
+        /* 单字符 t: 自检 */
+        if (p[1] == '\0') {
+            BLDCGimbal_RunSelfTest();
+            return;
+        }
+    }
+    if (strncmp(p, "pan", 3) == 0) {
+        int rpm = 0;
+        if (sscanf(p + 3, "%d", &rpm) == 1) {
+            g_jog_pan_rpm  = (int16_t)RPM_CLAMP(rpm);
+            g_jog_tilt_rpm = 0;
+            g_jog_until    = HAL_GetTick() + 3000;
+            g_feedback_until = HAL_GetTick() + 150;
+            CmdReply("# OK 手动点动 PAN=%d RPM (持续 3s, 绕开 K230)\r\n", (int)g_jog_pan_rpm);
+        } else {
+            CmdReply("# 用法: pan <rpm>  (如 pan 150 / pan -100)\r\n");
+        }
+        return;
+    }
+    if (strncmp(p, "tilt", 4) == 0) {
+        int rpm = 0;
+        if (sscanf(p + 4, "%d", &rpm) == 1) {
+            g_jog_tilt_rpm = (int16_t)RPM_CLAMP(rpm);
+            g_jog_pan_rpm  = 0;
+            g_jog_until    = HAL_GetTick() + 3000;
+            g_feedback_until = HAL_GetTick() + 150;
+            CmdReply("# OK 手动点动 TILT=%d RPM (持续 3s, 绕开 K230)\r\n", (int)g_jog_tilt_rpm);
+        } else {
+            CmdReply("# 用法: tilt <rpm>  (如 tilt 150 / tilt -100)\r\n");
+        }
+        return;
+    }
+
+    /* ---- [v6.10] 闭环调试命令: 显示真实角度 / 重新设零 / 阻尼开关 ---- */
+    if (strncmp(p, "angle", 5) == 0) {
+        uint8_t v1 = BLDCGimbal_AngleValidId(1);
+        uint8_t v2 = BLDCGimbal_AngleValidId(2);
+        int32_t a1 = BLDCGimbal_GetAngle(1);
+        int32_t a2 = BLDCGimbal_GetAngle(2);
+        CmdReply("# F32C 角度(0.1°): Pan(id1)=%ld (%.2f°) valid=%d | Tilt(id2)=%ld (%.2f°) valid=%d\r\n",
+                 (long)a1, (double)a1/10.0, (int)v1, (long)a2, (double)a2/10.0, (int)v2);
+        CmdReply("#  闭环阻尼=%s (fbdamp on/off 切换)\r\n", g_fb_damp_en ? "ON" : "OFF");
+        return;
+    }
+    if (strncmp(p, "zero", 4) == 0) {
+        BLDCGimbal_SetZero();
+        CmdReply("# OK 两轴已设零 (当前机械位置=0, 多圈角清零)\r\n");
+        return;
+    }
+    if (strncmp(p, "fbdamp", 6) == 0) {
+        if (strncmp(p + 6, " off", 4) == 0 || strncmp(p + 6, " OFF", 4) == 0) {
+            g_fb_damp_en = 0;
+            CmdReply("# OK 闭环阻尼关闭 → 回退模型位置阻尼\r\n");
+        } else if (strncmp(p + 6, " on", 3) == 0 || strncmp(p + 6, " ON", 3) == 0) {
+            g_fb_damp_en = 1;
+            CmdReply("# OK 闭环阻尼开启 → 用 F32C 真实角度做速度阻尼\r\n");
+        } else {
+            CmdReply("# fbdamp on/off  — 闭环速度阻尼开关(当前 %s)\r\n", g_fb_damp_en ? "ON" : "OFF");
+        }
+        return;
+    }
+
     /* ---- [v5.10] K230 任务触发命令 (上位机菜单用): 与板载 PA0/PA1 等价 ---- */
     if (strncmp(p, "aim", 3) == 0) {
         TriggerK230Task(K230_CMD_AIM);
@@ -1236,6 +1215,40 @@ static void Serial_Execute(void)
         return;
     }
 
+    /* [无刷云台] 实时调速度比例: rpm <值> ; 无参数显示当前值.
+     *   模型角速度(°/s = 100000/step_delay_us) × 本值 = 指令 RPM, 直接决定云台转速。
+     *   例: rpm 0.6 → 比例 0.6. 范围 0.05~3.0. 在 AUTO 模式下也放行(不被 'r' 拦截)。 */
+    if (strncmp(p, "rpm", 3) == 0) {
+        float v = 0.0f;
+        if (sscanf(p + 3, "%f", &v) == 1) {
+            if (v < 0.05f) v = 0.05f;
+            if (v > 3.0f)  v = 3.0f;
+            g_motor_rpm_scale = v;
+            CmdReply("# OK 速度比例 MOTOR_RPM_PER_DEGPS = %.3f (实时生效)\r\n", (double)v);
+        } else {
+            CmdReply("# 速度比例 MOTOR_RPM_PER_DEGPS = %.3f (范围 0.05~3.0, 例: rpm 0.6)\r\n",
+                     (double)g_motor_rpm_scale);
+        }
+        return;
+    }
+
+    /* [v6.11] 实时调加速度: acc <值>(转/s²); 无参数显示提示.
+     *   对照 WHEELTEC 官方固件 init 设为 75。过小→速度突变跟不上(闭环滞后过冲),
+     *   过大→起步冲击。两轴同时下发。范围 1~1000。 */
+    if (strncmp(p, "acc", 3) == 0) {
+        int v = 0;
+        if (sscanf(p + 3, "%d", &v) == 1) {
+            if (v < 1)    v = 1;
+            if (v > 1000) v = 1000;
+            BLDCGimbal_SetAcc(1, (uint16_t)v);
+            BLDCGimbal_SetAcc(2, (uint16_t)v);
+            CmdReply("# OK 加速度 = %d 转/s² (两轴已下发)\r\n", v);
+        } else {
+            CmdReply("# 加速度 acc <1~1000> (例: acc 75)\r\n");
+        }
+        return;
+    }
+
     /* ---- K230 自动打靶模式下: 仅放行"安全控制命令"(退出/调参/查询),
      *      拦截会抢占电机的手动步进命令(p/t/c/a/s/f/h/d 等),
      *      防止 AUTO 被误踢或自相冲突。这样串口/上位机就能在 AUTO 下
@@ -1259,7 +1272,7 @@ static void Serial_Execute(void)
     g_gimbal_mode = GIMBAL_SERIAL;
     g_feedback_until = HAL_GetTick() + 150;
     LED_ON();
-    CmdReply("\r\n> %s\r\n", s_serial_buf);   /* 回显用户发出的命令 (走蓝牙) */
+    CmdReply("\r\n> %s\r\n", s_serial_buf);   /* 回显用户发出的命令 (USART1 控制台) */
 
     /* ---- 单字符命令 (区分 i/I 和 p/P, 其余不区分大小写) ---- */
     switch (*p) {
@@ -1657,19 +1670,17 @@ static void K230_SendStatus(void)
              ((g_gimbal_mode == GIMBAL_AUTO) ? 0x02 : 0x00);
     buf[6] = 0;  /* 填充字节 */
     buf[7] = (buf[0] + buf[1] + buf[2] + buf[3] + buf[4] + buf[5] + buf[6]) & 0xFF;
-    HAL_UART_Transmit(&huart3, buf, 8, 10);
+    HAL_UART_Transmit(&huart2, buf, 8, 10);   /* 发往 K230(USART2) */
 }
 
 /**
- * @brief 向蓝牙(USART2)转发矩形识别结果
+ * @brief 向 USART1(PC 控制台)转发矩形识别结果 (蓝牙已移除)
  *        格式: RECT,<dx>,<dy>,<w>,<h>,<ang>,<valid>\n
  *        dx,dy = 矩形中心相对靶心偏移(px); w,h = 矩形宽高(px); ang = 倾斜角(0.1°)
  *        valid = bit0 矩形有效 | bit1 靶心(原点)有效
  */
 static void K230_SendRectTelemetry(void)
 {
-    if (!HAL_IS_BIT_SET(huart2.Instance->CR1, USART_CR1_UE)) return;
-    if (BT_RingUsed() > BT_TX_RING_SIZE * 3 / 5) return;   /* 防溢出 */
     char buf[64];
     int n = snprintf(buf, sizeof(buf),
         "RECT,%+6d,%+6d,%5u,%5u,%+6d,%d\r\n",
@@ -1678,27 +1689,23 @@ static void K230_SendRectTelemetry(void)
         (int)g_rect_ang,
         (g_rect_valid ? 1 : 0) | (g_rect_origin_valid ? 2 : 0));
     if (n > 0) {
-        BT_UART_PutStr(buf, n);
-        Telemetry_MirrorToU1(buf, n);   /* [v5.10] 镜像到 USART1 */
+        Telemetry_MirrorToU1(buf, n);   /* [v5.10] 发往 USART1(PC 控制台) */
     }
 }
 
 /**
- * @brief 向上位机/蓝牙转发 K230 任务状态
+ * @brief 向 USART1(PC 控制台)转发 K230 任务状态 (蓝牙已移除)
  *        格式: TASK,<id>,<done>\n
  *        id:  0=未知/IDLE/AIM 1=RECENTER 2=BORDER 3=INNER
  *        done:0=进行中 1=命中锁定/稳态达成(完成)
  */
 static void K230_SendTaskTelemetry(void)
 {
-    if (!HAL_IS_BIT_SET(huart2.Instance->CR1, USART_CR1_UE)) return;
-    if (BT_RingUsed() > BT_TX_RING_SIZE * 3 / 5) return;   /* 防溢出 */
     char buf[32];
     int n = snprintf(buf, sizeof(buf), "TASK,%d,%d\r\n",
                      (int)g_k230_task_id, (int)g_k230_task_done);
     if (n > 0) {
-        BT_UART_PutStr(buf, n);
-        Telemetry_MirrorToU1(buf, n);   /* [v5.10] 镜像到 USART1 */
+        Telemetry_MirrorToU1(buf, n);   /* [v5.10] 发往 USART1(PC 控制台) */
     }
 }
 
@@ -1709,13 +1716,13 @@ static void K230_SendTaskTelemetry(void)
  */
 static void K230_SendCmd(uint8_t cmd)
 {
-    if (!HAL_IS_BIT_SET(huart3.Instance->CR1, USART_CR1_UE)) return;
+    if (!HAL_IS_BIT_SET(huart2.Instance->CR1, USART_CR1_UE)) return;
     uint8_t buf[9];
     buf[0] = 0x3C; buf[1] = 0x3C;
     buf[2] = cmd;  buf[3] = 0;
     buf[4] = 0;    buf[5] = 0; buf[6] = 0;
     buf[7] = 1;    buf[8] = 1;
-    HAL_UART_Transmit(&huart3, buf, 9, 20);
+    HAL_UART_Transmit(&huart2, buf, 9, 20);   /* 发往 K230(USART2) */
 }
 
 /**
@@ -1725,8 +1732,15 @@ static void K230_SendCmd(uint8_t cmd)
  */
 static void TriggerK230Task(uint8_t cmd)
 {
-    K230_SendCmd(cmd);        /* 命令帧发往 K230 (USART3) */
-    K230_HandleCommand(cmd);  /* 更新 STM32 本地状态: 任务ID/AUTO/解锁/复位 */
+    K230_SendCmd(cmd);        /* 命令帧发往 K230 (USART2) */
+    K230_HandleCommand(cmd);  /* 同步 STM32 本地任务状态(不自动使能 AUTO) */
+    /* [v6.4] 用户通过串口触发的任务: 显式使能自动打靶(属于"用户指令").
+     *   这是唯一允许经 K230_HandleCommand 路径点亮 AUTO 的地方; K230 自发
+     *   的命令帧(按键)走 K230_ProcessFrame→K230_HandleCommand 则不会点亮. */
+    g_auto_enabled = 1;
+    g_gimbal_mode  = GIMBAL_AUTO;
+    g_k230_last_valid = 0;
+    g_k230_last_frame = HAL_GetTick();
 }
 
 /* ---- v4.3: PID 输出低通滤波 (每轴) ---- */
@@ -1792,6 +1806,41 @@ static void K230_ControlAxis(StepperMotor *motor, K230_PID *pid,
 
         /* v5.0 速度控制器: 输出为带符号速度指令 [-1,1] (无积分, 不过冲) */
         float vel_out = K230_PID_Update(pid, kf_err);
+
+        /* [v6.1] 实测轴速度阻尼 (轮趣级联"速度内环"本质):
+         *   用云台实际位置增量(步/帧)反向抵消速度指令, 直接压制过冲/反弹。
+         *   这是对被控量本身的阻尼, 比仅对误差求导更稳, 且不放大 K230 噪声。 */
+        /* [v6.10] 闭环实测轴速度阻尼: 优先用 F32C 真实角度增量; 无反馈(或 fbdamp off)时
+         *         回退模型位置增量. fb_id: Pan=1, Tilt=2; 真实角度单位 0.1°(与模型同单位).
+         *         真实运动反向叠加到速度指令 → 速度阻尼, 彻底消"盲 PID"导致的摇摆/极限环. */
+        int32_t cur_pos = Stepper_GetPosition(motor);   /* 模型位置(0.1°) */
+        static int32_t s_prev_fb_angle[2] = {0x80000000, 0x80000000};
+        int fb_idx = (motor == &g_motor_pan) ? 0 : 1;
+        uint8_t fb_id = (motor == &g_motor_pan) ? 1 : 2;
+        uint8_t real_ok = g_fb_damp_en ? BLDCGimbal_AngleValidId(fb_id) : 0;
+        float meas_vel = 0.0f;
+        int32_t model_rate = (pid->prev_pos != (int32_t)0x80000000)
+                                 ? (cur_pos - pid->prev_pos) : 0;
+        if (real_ok) {
+            int32_t ra = BLDCGimbal_GetAngle(fb_id);     /* 真实角度(0.1° 有符号) */
+            if (s_prev_fb_angle[fb_idx] != (int32_t)0x80000000) {
+                meas_vel = (float)(ra - s_prev_fb_angle[fb_idx]);   /* 真实速度(0.1°/帧) */
+                /* 符号自校正: 对齐模型速度方向, 防 F32C 角度符号相反导致抗阻尼(发散) */
+                if (model_rate > 0 && meas_vel < 0.0f) meas_vel = -meas_vel;
+                else if (model_rate < 0 && meas_vel > 0.0f) meas_vel = -meas_vel;
+                if (meas_vel >  200.0f) meas_vel =  200.0f;
+                if (meas_vel < -200.0f) meas_vel = -200.0f;
+            }
+            s_prev_fb_angle[fb_idx] = ra;
+        } else {
+            meas_vel = (float)model_rate;
+            if (meas_vel >  200.0f) meas_vel =  200.0f;
+            if (meas_vel < -200.0f) meas_vel = -200.0f;
+            s_prev_fb_angle[fb_idx] = 0x80000000;   /* 反馈恢复后重置基准 */
+        }
+        vel_out -= CTRL_RATE_DAMP * meas_vel;       /* 真实运动反向叠加 → 速度阻尼 */
+        pid->prev_pos = cur_pos;
+
         if (vel_out >  1.0f) vel_out =  1.0f;
         if (vel_out < -1.0f) vel_out = -1.0f;
 
@@ -1880,15 +1929,21 @@ static void K230_ControlAxis(StepperMotor *motor, K230_PID *pid,
          *   带到了 ±LIM 之外)时会双向锁死, 该轴永远无法回到限位内 → 长期不动(Pan 卡死即此因).
          *   新逻辑: 仅禁止"进一步向外"的步进, 允许从限位外向中心回拉, 保证可恢复. */
         if (pos_limit_steps > 0) {
-            int32_t pos = Stepper_GetPosition(motor);
-            int32_t next = (dir == DIR_CW) ? pos + 1 : pos - 1;
+            /* [v6.10] 软限位优先用 F32C 真实角度(闭环位置保护, 根治"盲 PID 撞限位来回摆");
+             *         无反馈时回退模型位置. 两者单位均为 0.1°, 数值可直接比较. */
+            int32_t ref = Stepper_GetPosition(motor);    /* 模型位置 默认 */
+            uint8_t use_real = real_ok;
+            if (use_real) ref = BLDCGimbal_GetAngle(fb_id);   /* 真实角度(0.1°) */
+            int32_t lim = pos_limit_steps;
             int blocked = 0;
-            if (pos >= pos_limit_steps) {
-                if (dir == DIR_CW) blocked = 1;          /* 已在 +限位外, 禁止继续 + */
-            } else if (pos <= -pos_limit_steps) {
-                if (dir == DIR_CCW) blocked = 1;         /* 已在 -限位外, 禁止继续 - */
-            } else if (next > pos_limit_steps || next < -pos_limit_steps) {
-                blocked = 1;                             /* 正常区间: 禁止越界 */
+            if (ref >= lim) {
+                if (dir == DIR_CW) blocked = 1;          /* 已达 +限位, 禁止继续 + */
+            } else if (ref <= -lim) {
+                if (dir == DIR_CCW) blocked = 1;         /* 已达 -限位, 禁止继续 - */
+            } else if (!use_real) {
+                /* 模型模式: 预判下一步是否越界(真实角度已逐字节判定, 无需 next) */
+                int32_t next = (dir == DIR_CW) ? ref + 1 : ref - 1;
+                if (next > lim || next < -lim) blocked = 1;
             }
             if (blocked) {
                 if (Stepper_GetState(motor) != STATE_IDLE) Stepper_Stop(motor);
@@ -1899,8 +1954,9 @@ static void K230_ControlAxis(StepperMotor *motor, K230_PID *pid,
                 static uint8_t lim_print = 0;
                 if (!lim_print) {
                     lim_print = 1;
-                    printf("\r\n[%s] 到达限位 ±%ld 步, 停止转动\r\n",
-                           axis_label, (long)pos_limit_steps);
+                    printf("\r\n[%s] 到达限位 ±%ld (0.1°), 停止转动%s\r\n",
+                           axis_label, (long)lim,
+                           use_real ? " (真实角度)" : " (模型位置)");
                 }
                 return;
             }
@@ -1978,22 +2034,91 @@ static void K230_Freeze(const char *reason)
 }
 
 /**
+ * @brief 单轴回中: 以受限速度把该轴位置拉回正前方中心(pos=0)
+ *        方向恒指向 0, 到达死区即停; 不超出软限位(中心在限位内)。
+ */
+static void K230_RecoverAxis(StepperMotor *motor, uint32_t delay_us)
+{
+    int32_t pos = Stepper_GetPosition(motor);
+    if (pos >  RECOVER_DEADBAND) {
+        Stepper_SetDirection(motor, DIR_CCW);   /* pos>0 → 减小 pos 回中 */
+    } else if (pos < -RECOVER_DEADBAND) {
+        Stepper_SetDirection(motor, DIR_CW);    /* pos<0 → 增大 pos 回中 */
+    } else {
+        if (Stepper_GetState(motor) != STATE_IDLE) Stepper_Stop(motor);
+        return;
+    }
+    if (Stepper_GetState(motor) != STATE_RUNNING) Stepper_RunContinuously(motor);
+    Stepper_UpdateTargetSpeed(motor, delay_us);
+}
+
+/**
+ * @brief 激光丢失回中寻回 — 真正落地"有界扫描/拉回"
+ *        触发条件(主循环判定): K230 上报 search 标志 或 持续无有效帧。
+ *        行为: 双轴受限速度拉回正前方中心(pos=0), 让激光重新进入相机可见范围;
+ *              一旦重新收到有效帧(已回中/重新捕获)立即退出, 交还自动跟踪, 避免大幅摆动。
+ *        若激光始终不恢复, 云台停在正前方中心(最安全待机位), 不狂转。
+ */
+static void K230_RecoverToCenter(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    /* 重新捕获: 最新一帧有效(激光重新进入可见范围) → 退出回中, 恢复自动跟踪。
+     * [v6.2 修复] 回中期间主循环不调 K230_ProcessFrame, g_k230_last_valid 不刷新,
+     *   故改用 ISR 实时更新的 g_k230_flags 的 valid 位判断, 避免"已找回却卡在回中"。 */
+    if (g_k230_flags & K230_FLAG_VALID) {
+        if (g_recover_active) {
+            g_recover_active = 0;
+            K230_PID_Reset(&g_pid_pan);
+            K230_PID_Reset(&g_pid_tilt);
+            g_pan_vel_ema = 0.0f; g_tilt_vel_ema = 0.0f;
+            g_kf_x.init = 0; g_kf_y.init = 0;
+            g_hit_locked = 0;       /* 释放命中锁存, 允许重新捕获 */
+            g_k230_task_done = 0;
+            g_k230_last_valid = now;  /* 刷新, 避免退出瞬间又被判为"激光丢失" */
+            printf("\r\n[K230] 回中完成/重新捕获 → 恢复自动跟踪\r\n");
+        }
+        return;
+    }
+
+    /* 进入回中: 首次激活时清控制器, 避免用脏误差继续闭环 */
+    if (!g_recover_active) {
+        g_recover_active = 1;
+        Stepper_Stop(&g_motor_pan);
+        Stepper_Stop(&g_motor_tilt);
+        K230_PID_Reset(&g_pid_pan);
+        K230_PID_Reset(&g_pid_tilt);
+        g_kf_x.init = 0; g_kf_y.init = 0;
+        g_pan_vel_ema = 0.0f; g_tilt_vel_ema = 0.0f;
+        g_pan_out_filter = 0.0f; g_tilt_out_filter = 0.0f;
+        g_conf_streak = 0;
+        g_hit_locked  = 0;     /* 激光丢失: 解除命中锁存, 允许重新捕获 */
+        g_k230_task_done = 0;
+        printf("\r\n[K230] 激光丢失 → 启动回中拉回(正前方可见范围)\r\n");
+    }
+
+    /* 双轴受限速度拉回中心 */
+    K230_RecoverAxis(&g_motor_pan,  RECOVER_DELAY_US);
+    K230_RecoverAxis(&g_motor_tilt, RECOVER_DELAY_US);
+}
+
+/**
  * @brief 处理 K230 命令帧 (按键触发, 主循环上下文调用)
  *        命令: 0x01=AIM 0x02=RECENTER 0x03=TRACE_BORDER 0x04=TRACE_INNER 0x05=STOP
- *        - 切换显示用任务 ID
- *        - 解除命中锁存, 允许重新捕获/再运行
- *        - STOP 直接冻结云台
+ *        [v6.4] 仅同步显示用任务 ID / 解除命中锁存 / 复位 PID — 绝不自动
+ *        使能或退出 AUTO. 自动打靶只能由用户显式触发(串口 aim 等 / 板载 PA0/PA1),
+ *        保证"没有发指令不要动"不被 K230 自发命令帧绕过.
  */
 static void K230_HandleCommand(uint8_t cmd)
 {
     const char *name = "?";
-    uint8_t id = 0, stop = 0;
+    uint8_t id = 0;
     switch (cmd) {
         case 0x01: name = "AIM";      id = 0; break;  /* 通用自动打靶(跟随误差) */
         case 0x02: name = "RECENTER"; id = 1; break;  /* 激光对中到 A4 中心 */
         case 0x03: name = "BORDER";   id = 2; break;  /* 激光绕外框一周 */
         case 0x04: name = "INNER";    id = 3; break;  /* 激光绕内框一周 */
-        case 0x05: name = "STOP";     id = 0; stop = 1; break;
+        case 0x05: name = "STOP";     id = 0; break;
         default:   name = "UNK";      break;
     }
     g_k230_task_id   = id;
@@ -2006,18 +2131,11 @@ static void K230_HandleCommand(uint8_t cmd)
     g_pid_pan.locked  = 0;
     g_pid_tilt.locked = 0;
     g_pan_vel_ema = 0.0f; g_tilt_vel_ema = 0.0f;   /* 清除速度滤波历史 */
-    if (stop) {
-        K230_Freeze("收到 STOP 命令");
-        g_auto_enabled = 0;
-        g_gimbal_mode = GIMBAL_POSCTRL;
-        printf("\r\n[K230] 收到命令[STOP] → 停车/位置闭环 (自动打靶已禁用)\r\n");
-    } else {
-        g_auto_enabled = 1;            /* 命令即进入自动打靶, 等待 K230 坐标帧驱动 */
-        g_gimbal_mode = GIMBAL_AUTO;
-        g_k230_last_valid = 0;
-        g_k230_last_frame = HAL_GetTick();
-        printf("\r\n[K230] 收到命令[%s] 任务=%d → 自动打靶(AUTO)\r\n", name, id);
-    }
+    /* [v6.4] K230→STM32 命令帧只同步任务状态, 绝不自动使能/退出 AUTO.
+     *   自动打靶只能由用户显式触发(USART1 串口 aim/recenter/border/inner,
+     *   或板载 PA0/PA1). 无论 K230 是否开机自启任务或按键, 都不会绕过
+     *   "没有发指令不要动" 的闸门 — STM32 在收到用户指令前始终待命. */
+    printf("\r\n[K230] 同步任务[%s] id=%d (不自动使能 AUTO)\r\n", name, id);
 }
 
 /**
@@ -2030,13 +2148,13 @@ static void K230_HandleCommand(uint8_t cmd)
  *   闭环目标: 让激光移动到靶心, 即消除 err。
  *   控制量符号: dir_out = invert ? -vel : vel;  dir_out>=0 -> DIR_CW -> 位置计数+。
  *   机械安装方向差异由 per-axis invert 吸收:
- *     Pan : g_pan_dir_invert  = 1  (水平机械方向需反转)
+ *     Pan : g_pan_dir_invert  = 0  (v6.2 实测 AUTO 反向, 改正向; 仍反发 i 翻转)
  *     Tilt: g_tilt_dir_invert = 0
  *   -> 两轴共用同一控制函数与符号约定, 仅 invert 不同, 坐标系统一。
  */
 static void K230_ProcessFrame(void)
 {
-    /* 处理来自 K230 的命令帧(按键触发): 切换任务/解锁 — 主循环上下文, 可安全 printf */
+    /* [v6.4] 处理来自 K230 的命令帧(按键触发): 仅同步任务状态/解锁, 不使能 AUTO */
     if (g_k230_cmd_pending) {
         K230_HandleCommand(g_k230_cmd_pending);
         g_k230_cmd_pending = 0;
@@ -2183,16 +2301,32 @@ static void K230_ProcessFrame(void)
         g_locked_feedback = 0;   /* 未命中, 正常追踪 */
     }
 
-    /* [调试心跳] 每 1s 打印 K230 帧统计, 便于串口定位通信问题 */
+    /* [调试心跳] 每 1s 打印 K230 帧统计 + 控制状态 + 实际发往 F32C 的 cmd_rpm,
+     * 便于确认"系统还在正常运行"以及定位"发指令不动"到底是逻辑层还是 F32C 硬件层。 */
     {
         static uint32_t k230_hb_tick = 0;
         uint32_t now = HAL_GetTick();
         if (now - k230_hb_tick > 1000) {
             k230_hb_tick = now;
-            printf("\r\n[K230] hb: frames=%lu crc_err=%lu valid=%d err=(%d,%d) flags=0x%02X task=%d done=%d",
+            uint32_t rx_age    = g_k230_last_frame ? (uint32_t)(now - g_k230_last_frame) : 0xFFFFFFFFu;
+            uint32_t valid_age = g_k230_last_valid ? (uint32_t)(now - g_k230_last_valid) : 0xFFFFFFFFu;
+            printf("\r\n[K230] hb: auto=%d mode=%d frames=%lu crc_err=%lu valid=%d "
+                   "err=(%d,%d) flags=0x%02X task=%d done=%d "
+                   "cmd_rpm=(%d,%d) <-- 发往F32C  rx_age=%lums valid_age=%lums",
+                   (int)g_auto_enabled, (int)g_gimbal_mode,
                    (unsigned long)g_k230_frames, (unsigned long)g_k230_crc_err,
                    (int)valid, (int)g_k230_err_x, (int)g_k230_err_y,
-                   (unsigned)g_k230_flags, (int)g_k230_task_id, (int)g_k230_task_done);
+                   (unsigned)g_k230_flags, (int)g_k230_task_id, (int)g_k230_task_done,
+                   (int)g_motor_pan.cmd_rpm, (int)g_motor_tilt.cmd_rpm,
+                   (unsigned long)rx_age, (unsigned long)valid_age);
+            /* [v6.10] 追加 F32C 真实角度(闭环反馈), 便于确认"反馈链路是否通 + 当前位置" */
+            printf("  F32C角度(0.1°): Pan=%ld(%.1f°) Tilt=%ld(%.1f°) valid=%d",
+                   (long)BLDCGimbal_GetAngle(1), (double)BLDCGimbal_GetAngle(1)/10.0,
+                   (long)BLDCGimbal_GetAngle(2), (double)BLDCGimbal_GetAngle(2)/10.0,
+                   (int)BLDCGimbal_AngleValid());
+            if (g_k230_last_frame == 0 || rx_age > 1500) {
+                printf("\r\n[WARN] K230 链路静默 >1.5s! 坐标帧未到达 STM32(检查 USART2/PA2-PA3 接线与 K230 main.py 串口配置)");
+            }
         }
     }
 }
@@ -2213,11 +2347,16 @@ static void K230_TimeoutCheck(void)
         goto k230_stop;
     }
 
-    /* 持续无效帧超时 (一直在收帧但全是 valid=0 超过 2s) → 缓停 */
+    /* 持续无效帧超时 (一直在收帧但全是 valid=0 超过 2s):
+     *   [v6.2] 交给 K230_RecoverToCenter 拉回正前方(主循环已据 last_valid 触发回中),
+     *   此处不再切 SERIAL, 避免回中过程被打断; 仅当未处于回中时才安全停车。 */
     if (g_k230_last_valid > 0 &&
         now - g_k230_last_valid > K230_FRAME_TIMEOUT_MS) {
-        printf("[K230] 持续无效帧! 停止电机 (laser lost)\n");
-        goto k230_stop;
+        if (!g_recover_active) {
+            printf("[K230] 持续无效帧! 停止电机 (laser lost)\n");
+            goto k230_stop;
+        }
+        return;   /* 回中进行中: 保持 AUTO, 让 recovery 把云台拉回正前方 */
     }
 
     return;
@@ -2654,17 +2793,12 @@ static void Gimbal_Dance(void)
 
 /* ========================== OLED 调试刷新 ========================== */
 
-/* ========================== 蓝牙状态上报 ========================== */
+/* ========================== 控制台高频遥测上报 ========================== */
 
-/** @brief 向蓝牙(USART2)发送一份紧凑状态报告 (仅蓝牙, 不污染 K230 串口)
- *        格式与手机/PC 上位机解析器兼容; 单独发送避免 printf 经 _write 同时灌给 K230 */
-static void BT_SendReport(void)
+/** @brief 向 USART1(PC 控制台)发送紧凑状态报告 (蓝牙已移除, 不再经蓝牙串口)
+ *        格式与 PC 上位机解析器兼容; 单独发送避免 printf 经 _write 同时灌给 K230(USART2) */
+static void U1_SendTelemetry(void)
 {
-    if (!HAL_IS_BIT_SET(huart2.Instance->CR1, USART_CR1_UE)) return;
-
-    /* [v5.2] 遥测防溢出: 缓冲≥60% 满时跳帧, 避免 CmdReply 发不出 */
-    if (BT_RingUsed() > BT_TX_RING_SIZE * 3 / 5) return;
-
     /* v5.0 速度指令代理 = Kp·误差 (限幅 ±1), 供上位机 PID 曲线绘制 */
     float p_pid = g_pid_pan.kp * g_k230_err_x;
     float t_pid = g_pid_tilt.kp * g_k230_err_y;
@@ -2686,8 +2820,7 @@ static void BT_SendReport(void)
         mode_ch);
 
     if (n > 0) {
-        BT_UART_PutStr(buf, n);   /* 非阻塞发送, 不再阻塞主循环(原 250ms 卡顿根因) */
-        Telemetry_MirrorToU1(buf, n);   /* [v5.10] 镜像到 USART1(CH340/上位机) */
+        Telemetry_MirrorToU1(buf, n);   /* [v5.10] 发往 USART1(CH340/上位机) */
     }
 
     /* 同步转发矩形识别结果(相对靶心原点) */
@@ -2722,8 +2855,8 @@ static void OLED_Refresh(void)
 
     info.mode = ModeName(g_gimbal_mode);
     info.k230_mode = (g_gimbal_mode == GIMBAL_AUTO) ? 1 : 0;
-    snprintf(info.bt_line, sizeof(info.bt_line), "BT:%s",
-             g_bt_connected ? "ON " : "LOST");
+    snprintf(info.bt_line, sizeof(info.bt_line), "K2:%s",
+             (g_k230_last_frame != 0 && (HAL_GetTick() - g_k230_last_frame < 1000)) ? "OK " : "---");
 
     if (info.k230_mode) {
         /* === K230 自动打靶模式: 误差 + 误差条 + PID === */
@@ -2832,19 +2965,23 @@ int main(void)
     }
     IWDG_FEED();    /* OLED 初始化有多个 HAL_Delay, 喂狗防复位 */
 
-    /* 先初始化定时器硬件, 再初始化舵机 (Stepper_Init 内调 Servo_UpdatePWM 需要 htim1/htim3.Instance != NULL) */
-    TIM1_Init();        /* Tilt 舵机 PWM 定时器 (PA11=TIM1_CH4) */
+    /* 先初始化定时器硬件: TIM1/TIM3 已改为无刷方案用途
+     *   TIM1_Init(): 空函数 (Tilt 不再用舵机 PWM)
+     *   TIM3_Init(): 配置为 115200Hz 位时钟 (软件串口 TX → 电机 RX)
+     *   TIM2/TIM4: 两轴虚拟步进节拍定时器 (位置闭环模型用) */
+    TIM1_Init();        /* Tilt 舵机 PWM 已弃用 (空函数) */
     IWDG_FEED();
-    TIM3_Init();        /* Pan 舵机 PWM 定时器 (PB1=TIM3_CH4) */
+    TIM3_Init();        /* 无刷云台软件串口位时钟 (PA4 TX) */
     IWDG_FEED();
     TIM2_Init();        /* Pan 步进节拍定时器 */
     IWDG_FEED();
     TIM4_Init();        /* Tilt 步进节拍定时器 */
     IWDG_FEED();
 
-    /* 初始化两个舵机 (PWM 定时器已就绪, 可以安全写入 CCR)
-     * Pan : S20F 270° 舵机, TIM2节拍 + TIM3_CH4(PB1) PWM
-     * Tilt: S20F 180° 舵机, TIM4节拍 + TIM1_CH4(PA11) PWM */
+    /* 初始化两个"电机"(虚拟步进模型 + 无刷执行机构)
+     *   Pan : 模型 TIM2节拍, 无刷电机 ID1
+     *   Tilt: 模型 TIM4节拍, 无刷电机 ID2
+     * 第3/4参数 htim_pwm / pwm_channel 仅占位, 无刷走速度串口, 不再写 PWM CCR */
     Stepper_Init(&g_motor_pan,  &htim2, &htim3, SERVO_PAN_CHANNEL,
                   PAN_PULSE_MIN_US, PAN_PULSE_MAX_US, PAN_CENTER_US, PAN_US_PER_DEG,
                   POS_LIMIT_PAN_MIN, POS_LIMIT_PAN_MAX,
@@ -2856,9 +2993,10 @@ int main(void)
                   "Tilt");
     IWDG_FEED();
 
-    /* 舵机自检已取消 (上电直接回中位, 省去 3 次扫角) */
-    __HAL_TIM_SET_COMPARE(&htim3, SERVO_PAN_CHANNEL,  PAN_CENTER_US);
-    __HAL_TIM_SET_COMPARE(&htim1, SERVO_TILT_CHANNEL, TILT_CENTER_US);
+    /* 无刷云台初始化: 发激活字节 → 等待 1.5s 电机启动 → 使能两轴 → 设速度模式.
+     * 上电即把两轴速度置 0 (自锁保持当前角度), 不等舵机回中。 */
+    BLDCGimbal_Init();
+    IWDG_FEED();
 
     /* v4.10: 初始化两个 PID 控制器 (设置基础增益/段增益/微分滤波/退饱和等所有参数) */
     K230_PID_Init(&g_pid_pan,  PAN_GAIN, PAN_DEC_ZONE,  CTRL_KD, (float)PID_DEADZONE);
@@ -2871,7 +3009,7 @@ int main(void)
     Stepper_SetPositionLimits(&g_motor_tilt, POS_LIMIT_TILT_MIN, POS_LIMIT_TILT_MAX);
     g_pos_target_pan  = 0;
     g_pos_target_tilt = 0;
-    /* 用户要求: 上电电机不动, 收到串口/蓝牙命令才动 */
+    /* 用户要求: 上电电机不动, 收到串口命令才动 */
     /* (电机初始化后处于 idle 状态, step 0 保持力矩) */
 
     printf("\r\n");
@@ -2879,7 +3017,7 @@ int main(void)
     printf("  ║   舵机云台 控制系统 V1.0   ║\r\n");
     printf("  ║   Firmware v5.14 (连续跟随地板+圆角循迹) ║\r\n");
     printf("  ║   STM32F103C8T6 @ 72MHz  ║\r\n");
-    printf("  ║   Pan: PB1  Tilt: PA11   ║\r\n");
+    printf("  ║   Pan→ID1(PA4TX) Tilt→ID2 ║\r\n");
     printf("  ╚═══════════════════════════╝\r\n");
     printf("  输入 help 查看命令菜单\r\n");
     printf("  例: x30 y10 → Pan=30°, Tilt=10°\r\n\r\n");
@@ -2892,17 +3030,7 @@ int main(void)
             s_serial_len = 0;
         }
 
-        /* 蓝牙命令处理 (独立缓冲, 不与 USART1 交叉) */
-        if (s_bt_cmd_ready) {
-            s_bt_cmd_ready = 0;
-            /* 拷贝蓝牙命令到主缓冲并执行 */
-            memcpy(s_serial_buf, s_bt_buf, s_bt_len);
-            s_serial_len = s_bt_len;
-            /* 直接调用 Serial_Execute 处理蓝牙命令 */
-            Serial_Execute();
-            s_serial_len = 0;
-            s_bt_len = 0;
-        }
+        /* [v6.0] 蓝牙已移除: USART1(PA9/PA10) 为唯一命令入口, 上方 s_cmd_ready 分支已处理 */
 
         /* 按键扫描 */
         Gimbal_KeyScan();
@@ -2932,48 +3060,54 @@ int main(void)
             OLED_Refresh();
         }
 
-        /* K230 坐标帧处理 */
-        K230_ProcessFrame();
+        /* K230 坐标帧处理 + 激光丢失回中寻回 [v6.2] */
+        if (g_gimbal_mode == GIMBAL_AUTO) {
+            uint32_t now = HAL_GetTick();
+            /* 激光丢失判定: K230 上报 search 标志, 或 曾有效锁定后持续无有效帧 */
+            uint8_t laser_lost = g_k230_search ||
+                (g_k230_last_valid > 0 && (now - g_k230_last_valid) > RECOVER_TRIGGER_MS);
+            if (laser_lost) {
+                K230_RecoverToCenter();   /* 拉回正前方中心, 重新进入可见范围 */
+            } else {
+                K230_ProcessFrame();      /* 正常跟踪 */
+            }
+        } else {
+            K230_ProcessFrame();          /* 非 AUTO: 仍调用(内部 early-return) */
+        }
         K230_TimeoutCheck();
 
-        /* 向 K230 回传状态: 每 500ms */
+        /* 无刷云台: 把两轴模型速度换算成 RPM 发给电机 (速度闭环, IDLE 时发 0 自锁) */
+        BLDCGimbal_Task(&g_motor_pan, &g_motor_tilt);
+
+        /* 向 K230(USART2) 回传状态: 每 500ms */
         static uint32_t k230_status_tick = 0;
         if (HAL_GetTick() - k230_status_tick >= 500) {
             k230_status_tick = HAL_GetTick();
-            if (HAL_IS_BIT_SET(huart3.Instance->CR1, USART_CR1_UE)) {
+            if (HAL_IS_BIT_SET(huart2.Instance->CR1, USART_CR1_UE)) {
                 K230_SendStatus();
             }
         }
 
-        /* 蓝牙串口状态推送: 每 3s (手机/上位机调试用) */
+        /* 控制台高频遥测推送(USART1): 150ms (上位机 PID 曲线用) */
         static uint32_t bt_report_tick = 0;
         if (HAL_GetTick() - bt_report_tick >= 150) {   /* 上位机 PID 曲线: 150ms 高频遥测 */
             bt_report_tick = HAL_GetTick();
-            BT_SendReport();
+            U1_SendTelemetry();
         }
 
-        /* 蓝牙链路健康检测 + 重连指示 (每 500ms) */
-        IWDG_FEED();    /* 主循环喂狗 — IWDG 超时约 1s, 循环内至少每秒喂 1 次 */
-        static uint32_t bt_link_tick = 0;
-        if (HAL_GetTick() - bt_link_tick >= 500) {
-            bt_link_tick = HAL_GetTick();
-            if (g_bt_connected &&
-                (HAL_GetTick() - g_bt_last_rx_tick > BT_LINK_LOST_MS)) {
-                g_bt_connected = 0;
-                printf("[BT] 链路疑似断开 (超过 %dms 未收到数据), 等待重连...\r\n",
-                       (int)BT_LINK_LOST_MS);
-                BT_TryRecover();
-            }
-        }
+        /* 主循环喂狗 — IWDG 超时约 1s, 循环内至少每秒喂 1 次 */
+        IWDG_FEED();
 
-        /* LED 反馈: 串口命令到达时亮 150ms；平时双轴空闲则 500ms 慢闪 */
+        /* LED 反馈: 命令到达亮 150ms; 云台正被驱动(cmd_rpm≠0)时 150ms 快闪,
+         * 空闲时 500ms 慢闪 —— 肉眼即可判断"系统还在正常运行 / 是否在动"。 */
         static uint32_t led_tick = 0;
         if (HAL_GetTick() < g_feedback_until) {
             LED_ON();
-        } else if (HAL_GetTick() - led_tick > 500) {
-            led_tick = HAL_GetTick();
-            if (Stepper_GetState(&g_motor_pan) == STATE_IDLE &&
-                Stepper_GetState(&g_motor_tilt) == STATE_IDLE) {
+        } else {
+            int driving = (g_motor_pan.cmd_rpm != 0) || (g_motor_tilt.cmd_rpm != 0);
+            uint32_t period = driving ? 150 : 500;
+            if (HAL_GetTick() - led_tick >= period) {
+                led_tick = HAL_GetTick();
                 LED_TOG();
             }
         }
@@ -2996,7 +3130,8 @@ void TIM2_IRQHandler(void)
 }
 
 /**
- * @brief TIM4 中断 — Tilt 电机步进节拍 (TIM3 现为 Pan 舵机 PWM 输出)
+ * @brief TIM4 中断 — Tilt 电机步进节拍
+ *        (注: TIM3 已改作无刷云台软件串口位时钟, 不再用于舵机 PWM)
  */
 void TIM4_IRQHandler(void)
 {
@@ -3037,10 +3172,11 @@ void USART1_IRQHandler(void)
 }
 
 /**
- * @brief USART2 中断 (JDY-31 蓝牙)
- *        - TXE : 从环形缓冲续发剩余字节(非阻塞发送)
- *        - RXNE: 缓冲接收到的命令, 并更新链路活跃时间戳
- *        - 错误标志(ORE/NE/FE/PE)清除: 防止 UART 因噪声/溢出卡死
+ * @brief USART2 中断 (K230 视觉上位机) — 坐标帧状态机解析
+ *        [v6.0] K230 从 USART3 迁到 USART2(PA2/PA3), 解析逻辑随之整体迁移。
+ *        帧格式: 0x3C 0x3B [XH][XL][YH][YL][FLAG] 0x01 0x01
+ *        X/Y = signed int16 (Pan/Tilt 像素误差)
+ *        FLAG: bit0=valid, bit1=hit, bit2=hi_conf
  */
 void USART2_IRQHandler(void)
 {
@@ -3050,49 +3186,9 @@ void USART2_IRQHandler(void)
     if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_FE)  != RESET) { volatile uint8_t tmp __attribute__((unused)) = (uint8_t)(huart2.Instance->DR & 0xFF); }
     if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_PE)  != RESET) { volatile uint8_t tmp __attribute__((unused)) = (uint8_t)(huart2.Instance->DR & 0xFF); }
 
-    /* ---- TXE: 续发 ring 中剩余字节 ---- */
-    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_TXE) != RESET &&
-        __HAL_UART_GET_IT_SOURCE(&huart2, UART_IT_TXE) != RESET) {
-        if (g_bt_tx_head != g_bt_tx_tail) {
-            uint8_t b = g_bt_tx_ring[g_bt_tx_tail];
-            g_bt_tx_tail = (g_bt_tx_tail + 1) % BT_TX_RING_SIZE;
-            huart2.Instance->DR = b;
-        } else {
-            g_bt_tx_active = 0;
-            __HAL_UART_DISABLE_IT(&huart2, UART_IT_TXE);
-        }
-    }
-
-    /* ---- RXNE: 缓冲接收到的命令 ---- */
+    /* ---- RXNE: K230 帧解析状态机 ---- */
     if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_RXNE) != RESET) {
         uint8_t byte = (uint8_t)(huart2.Instance->DR & 0xFF);
-
-        /* 链路活跃: 收到任意蓝牙数据 → 标记已连接 + 记录时间戳(重连检测用) */
-        g_bt_connected = 1;
-        g_bt_last_rx_tick = HAL_GetTick();
-
-        /* 缓冲接收数据 (使用独立 bt 缓冲, 不与 USART1 交叉) */
-        if (s_bt_len < SERIAL_BUF_SIZE - 1) {
-            s_bt_buf[s_bt_len++] = (char)byte;
-        }
-        if (byte == '\n' || byte == '\r') {
-            s_bt_cmd_ready = 1;
-        } else if (s_bt_len >= SERIAL_BUF_SIZE - 1) {
-            s_bt_cmd_ready = 1;
-        }
-    }
-}
-
-/**
- * @brief USART3 中断 (K230 上位机) — 坐标帧状态机解析
- *        帧格式: 0x3C 0x3B [XH][XL][YH][YL][FLAG] 0x01 0x01
- *        X/Y = signed int16 (Pan/Tilt 像素误差)
- *        FLAG: bit0=valid, bit1=hit, bit2=hi_conf
- */
-void USART3_IRQHandler(void)
-{
-    if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_RXNE) != RESET) {
-        uint8_t byte = (uint8_t)(huart3.Instance->DR & 0xFF);
 
         switch (g_k230_fstate) {
             case K230_IDLE:
@@ -3165,54 +3261,72 @@ void USART3_IRQHandler(void)
                 }
                 break;
 
-        case K230_FOOTER2:
-            if (byte == 0x01) {
-                if (g_k230_ftype == 0) {
-                    /* 误差帧: CRC 覆盖 XH XL YH YL FLAG (5字节) */
-                    uint8_t crc_calc = K230_CRC8((const uint8_t *)g_k230_fbuf, 5);
-                    if (crc_calc == g_k230_fbuf[5]) {
-                        g_k230_err_x = (int16_t)((g_k230_fbuf[0] << 8) | g_k230_fbuf[1]);
-                        g_k230_err_y = (int16_t)((g_k230_fbuf[2] << 8) | g_k230_fbuf[3]);
-                        g_k230_flags = g_k230_fbuf[4];
-                        g_k230_corner = (g_k230_flags & K230_FLAG_CORNER) ? 1 : 0;  /* [v5.7] 接近拐角→减速 */
-                        g_k230_search = (g_k230_flags & K230_FLAG_SEARCH) ? 1 : 0;   /* [v5.13] 自动寻回中 */
-                        g_k230_frame_ready = 1;
-                        g_k230_frames++;
-                    } else {
-                        g_k230_crc_err++;   /* CRC 失败: 静默丢弃本帧 */
+            case K230_FOOTER2:
+                if (byte == 0x01) {
+                    if (g_k230_ftype == 0) {
+                        /* 误差帧: CRC 覆盖 XH XL YH YL FLAG (5字节) */
+                        uint8_t crc_calc = K230_CRC8((const uint8_t *)g_k230_fbuf, 5);
+                        if (crc_calc == g_k230_fbuf[5]) {
+                            g_k230_err_x = (int16_t)((g_k230_fbuf[0] << 8) | g_k230_fbuf[1]);
+                            g_k230_err_y = (int16_t)((g_k230_fbuf[2] << 8) | g_k230_fbuf[3]);
+                            g_k230_flags = g_k230_fbuf[4];
+                            g_k230_corner = (g_k230_flags & K230_FLAG_CORNER) ? 1 : 0;  /* [v5.7] 接近拐角→减速 */
+                            g_k230_search = (g_k230_flags & K230_FLAG_SEARCH) ? 1 : 0;   /* [v5.13] 自动寻回中 */
+                            g_k230_frame_ready = 1;
+                            g_k230_frames++;
+                        } else {
+                            g_k230_crc_err++;   /* CRC 失败: 静默丢弃本帧 */
+                        }
+                    } else if (g_k230_ftype == 1) {
+                        /* 矩形帧: CRC 覆盖 CXH..ANGH ANGL FLAGS (11字节) */
+                        uint8_t crc_calc = K230_CRC8((const uint8_t *)g_k230_fbuf, 11);
+                        if (crc_calc == g_k230_rcrc) {
+                            g_rect_dx = (int16_t)((g_k230_fbuf[0] << 8) | g_k230_fbuf[1]);
+                            g_rect_dy = (int16_t)((g_k230_fbuf[2] << 8) | g_k230_fbuf[3]);
+                            g_rect_w  = (uint16_t)((g_k230_fbuf[4] << 8) | g_k230_fbuf[5]);
+                            g_rect_h  = (uint16_t)((g_k230_fbuf[6] << 8) | g_k230_fbuf[7]);
+                            g_rect_ang = (int16_t)((g_k230_fbuf[8] << 8) | g_k230_fbuf[9]);
+                            g_rect_valid = (g_k230_fbuf[10] & 0x01) ? 1 : 0;
+                            g_rect_origin_valid = (g_k230_fbuf[10] & 0x02) ? 1 : 0;
+                            g_rect_frame_ready = 1;
+                        } else {
+                            g_k230_crc_err++;
+                        }
+                    } else if (g_k230_ftype == 2) {
+                        /* 命令帧: 解析 CMD (buf[0]), 切换任务/解锁 (主循环消费) */
+                        g_k230_cmd_pending = g_k230_fbuf[0];
                     }
-                } else if (g_k230_ftype == 1) {
-                    /* 矩形帧: CRC 覆盖 CXH..ANGH ANGL FLAGS (11字节) */
-                    uint8_t crc_calc = K230_CRC8((const uint8_t *)g_k230_fbuf, 11);
-                    if (crc_calc == g_k230_rcrc) {
-                        g_rect_dx = (int16_t)((g_k230_fbuf[0] << 8) | g_k230_fbuf[1]);
-                        g_rect_dy = (int16_t)((g_k230_fbuf[2] << 8) | g_k230_fbuf[3]);
-                        g_rect_w  = (uint16_t)((g_k230_fbuf[4] << 8) | g_k230_fbuf[5]);
-                        g_rect_h  = (uint16_t)((g_k230_fbuf[6] << 8) | g_k230_fbuf[7]);
-                        g_rect_ang = (int16_t)((g_k230_fbuf[8] << 8) | g_k230_fbuf[9]);
-                        g_rect_valid = (g_k230_fbuf[10] & 0x01) ? 1 : 0;
-                        g_rect_origin_valid = (g_k230_fbuf[10] & 0x02) ? 1 : 0;
-                        g_rect_frame_ready = 1;
-                    } else {
-                        g_k230_crc_err++;
-                    }
-                } else if (g_k230_ftype == 2) {
-                    /* 命令帧: 解析 CMD (buf[0]), 切换任务/解锁 (主循环消费) */
-                    g_k230_cmd_pending = g_k230_fbuf[0];
                 }
-            }
-            g_k230_fstate = K230_IDLE;
-            break;
+                g_k230_fstate = K230_IDLE;
+                break;
 
             default:
                 g_k230_fstate = K230_IDLE;
                 break;
         }
     }
+}
 
-    /* 清除溢出错误 */
-    if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_ORE) != RESET) {
-        __HAL_UART_CLEAR_OREFLAG(&huart3);
+/**
+ * @brief USART3 中断 (无刷云台 WHEELTEC F32C) — 仅 TX(STM32→电机), 不开 RX。
+ *        [v6.0] 云台改走 USART3 硬件串口(PB10 TX)。主循环用 HAL_UART_Transmit_IT
+ *        发帧, 必须由本 handler 调用 HAL_UART_IRQHandler 推进 TXE 传输并复位 gState,
+ *        否则 huart3.gState 永远 BUSY_TX, 后续帧被 Gimbal_UART_SendIT 跳过。
+ */
+void USART3_IRQHandler(void)
+{
+    /* [v6.10] 手动读取 RXNE 字节, 逐字节喂给 F32C 反馈帧解析器.
+     * 不用 HAL_UART_Receive_IT: 避免其状态机与阻塞发送(Gimbal_UART_Send)的
+     * gState 冲突, 也避免 HAL 在 TX 期间改写 huart3 状态导致发送卡死.
+     * F1 错误标志(ORE/NE/FE/PE)靠"读 SR 再读 DR"清除. */
+    uint32_t sr = huart3.Instance->SR;
+    if (sr & UART_FLAG_RXNE) {
+        uint8_t b = (uint8_t)(huart3.Instance->DR & 0xFF);
+        BLDCGimbal_RxByte(b);
+    } else if (sr & (UART_FLAG_ORE | UART_FLAG_NE | UART_FLAG_FE | UART_FLAG_PE)) {
+        /* 溢出/噪声/帧错: 读 DR 丢弃该字节并清标志, 防接收卡死 */
+        volatile uint8_t dummy = (uint8_t)(huart3.Instance->DR & 0xFF);
+        (void)dummy;
     }
 }
 

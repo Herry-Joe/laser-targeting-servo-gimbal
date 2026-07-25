@@ -27,32 +27,34 @@
 #include <string.h>
 #include <math.h>   /* fabsf */
 
-/* ========================== 底层 PWM 操作 ========================== */
+/* 无刷云台速度比例(定义在 bldc_gimbal.c, 可被串口 rpm 命令改写) */
+extern float g_motor_rpm_scale;
+
+/* ========================== 底层执行机构输出(无刷电机) ========================== */
 
 /**
- * @brief 将当前指令位置 pos_steps (0.1°/步) 映射为舵机脉宽并写入 CCR
+ * @brief 把当前模型速度换算成无刷电机指令转速(RPM), 存入 motor->cmd_rpm
  *
- * 使用该轴独立的脉宽映射参数 (motor->pulse_min/max/center_us):
- *   Pan  270°: 500us=0° ~ 2500us=270°, 中位1500us=135°
- *   Tilt 180°: 500us=0° ~ 2500us=180°, 中位1500us=90°
+ * 替代原舵机方案的"写 PWM 脉宽"。无刷电机(WHEELTEC F32C)走速度闭环模式:
+ *   - 模型角速度 = 100000 / step_delay_us  (°/s, step_delay_us 即每 0.1° 的节拍周期)
+ *   - 指令 RPM  = 模型角速度 * g_motor_rpm_scale, 方向由 motor->dir 决定
+ *   - 空闲(state=IDLE)时转速为 0 → 电机自锁保持当前角度
+ * 主循环 BLDCGimbal_Task() 读取 cmd_rpm 并组帧发给电机。
  */
-static void Servo_UpdatePWM(StepperMotor *motor)
+static void Actuator_Update(StepperMotor *motor)
 {
-    int32_t p = motor->pos_steps;
+    int16_t rpm = 0;
 
-    /* 限制到该轴硬限位 */
-    if (p < motor->pos_limit_min_hard) p = motor->pos_limit_min_hard;
-    if (p > motor->pos_limit_max_hard) p = motor->pos_limit_max_hard;
-
-    /* 角度(°) = 步数 / 每度步数 */
-    float deg = (float)p / (float)SERVO_STEPS_PER_DEG;
-
-    /* 脉宽(us) = 中位脉宽 + 角度 * 该轴 us/° */
-    int32_t pulse = (int32_t)(motor->center_us + deg * motor->us_per_deg);
-    if (pulse < motor->pulse_min_us) pulse = motor->pulse_min_us;
-    if (pulse > motor->pulse_max_us) pulse = motor->pulse_max_us;
-
-    __HAL_TIM_SET_COMPARE(motor->htim_pwm, motor->pwm_channel, (uint32_t)pulse);
+    if (motor->state != STATE_IDLE) {
+        /* 模型角速度 (°/s) */
+        float degps = 100000.0f / (float)motor->step_delay_us;
+        float rpmf  = degps * g_motor_rpm_scale;
+        if (motor->dir == DIR_CCW) rpmf = -rpmf;     /* 方向含机械反转(已由上层 bake 进 dir) */
+        if (rpmf >  32767.0f) rpmf =  32767.0f;
+        if (rpmf < -32768.0f) rpmf = -32768.0f;
+        rpm = (int16_t)rpmf;
+    }
+    motor->cmd_rpm = rpm;
 }
 
 /* ========================== 步进电机核心逻辑 ========================== */
@@ -86,7 +88,7 @@ static uint8_t Stepper_AdvanceOneStep(StepperMotor *motor)
     }
 
     /* 写入舵机 PWM (指令位置更新) */
-    Servo_UpdatePWM(motor);
+    Actuator_Update(motor);
 
     /* 目标步数递减 */
     if (motor->target_steps > 0) {
@@ -148,18 +150,17 @@ void Stepper_Init(StepperMotor *motor, TIM_HandleTypeDef *htim_step,
     }
 
     /* 上电将舵机置于中位 (pos_steps=0 → center_us), 避免舵机上电乱摆 */
-    Servo_UpdatePWM(motor);
+    Actuator_Update(motor);
 
-    printf("\r\n%s 舵机初始化完成 (PWM: %d~%dus, 中位%dbus, 行程±%.0f°)\r\n",
-           motor->label, (int)pmin_us, (int)pmax_us, (int)center_us,
-           (double)(pos_max_hard / SERVO_STEPS_PER_DEG));
+    printf("\r\n%s 电机初始化完成 (虚拟步进模型, 无刷速度闭环执行)\r\n",
+           motor->label);
 }
 
 void Stepper_SetMode(StepperMotor *motor, StepMode mode)
 {
     motor->mode = mode;
-    /* [舵机] 步进模式已无意义, 仅记录并打印 */
-    printf("[%s] 舵机模式已设置 (PWM 驱动, 无步进模式)\r\n", motor->label);
+    /* [无刷] 步进模式已无意义, 仅记录并打印 */
+    printf("[%s] 无刷电机 (速度闭环, 无步进模式概念)\r\n", motor->label);
 }
 
 void Stepper_SetDirection(StepperMotor *motor, Direction dir)
@@ -290,7 +291,7 @@ void Stepper_ZeroPosition(StepperMotor *motor)
     motor->target_pos = 0;
     __enable_irq();
     /* 立即把舵机指令到中位 */
-    Servo_UpdatePWM(motor);
+    Actuator_Update(motor);
     printf("[%s] 位置归零 (舵机回中位)\r\n", motor->label);
 }
 
@@ -363,8 +364,8 @@ void Stepper_Stop(StepperMotor *motor)
     motor->target_steps = 0;
     motor->work_mode = WORK_MODE_MANUAL;
     __enable_irq();
-    /* 舵机: 不改写 PWM, 保持最后指令位置 (舵机自锁, 云台不下垂) */
-    printf("[%s] 停止 (舵机保持位置)\r\n", motor->label);
+    /* 无刷: 发速度 0 指令 → 电机自锁保持当前角度 (云台不下垂) */
+    printf("[%s] 停止 (电机保持位置)\r\n", motor->label);
 }
 
 /* ========================== 定时器中断处理 ========================== */
@@ -455,8 +456,8 @@ void Stepper_PrintStatus(const StepperMotor *motor)
     const char *state_str[] = {"空闲", "连续运行", "定步运行", "定角运行"};
     const char *work_str[]  = {"手动", "扫描", "串口", "位置闭环"};
 
-    printf("\r\n========== %s 舵机状态 ==========\r\n", motor->label);
-    printf(" 驱动方式 : 舵机 PWM (TIM3)\r\n");
+    printf("\r\n========== %s 电机状态 ==========\r\n", motor->label);
+    printf(" 驱动方式 : 无刷电机速度闭环 (USART3 PB10 硬件串口 TX)\r\n");
     printf(" 旋转方向 : %s\r\n",   dir_str[motor->dir]);
     printf(" 运行状态 : %s\r\n",   state_str[motor->state]);
     printf(" 工作模式 : %s\r\n",   work_str[motor->work_mode]);

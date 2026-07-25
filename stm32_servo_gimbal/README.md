@@ -1,10 +1,10 @@
-# STM32F103C8T6 舵机二维云台固件（激光打靶）
+# STM32F103C8T6 无刷电机二维云台固件（激光打靶）
 
 > 双轴 **S20F 舵机 + 空心滑环** 方案：Pan 水平 / Tilt 俯仰由 **50Hz PWM** 驱动。
 > - **Pan 舵机** → **PB1 = TIM3_CH4**
 > - **Tilt 舵机** → **PA11 = TIM1_CH4**
 >
-> K230（庐山派 / CanMV）识别圆形靶心 + 红色激光光斑，通过 USART3 发送“靶心-画面中心误差”帧，STM32 用速度控制器闭环驱动云台把激光对准靶心。激光与摄像头同轴，靶心居中即命中。
+> K230（庐山派 / CanMV）识别圆形靶心 + 红色激光光斑，通过 USART2（PA2/PA3）发送“靶心-画面中心误差”帧，STM32 用速度控制器闭环驱动无刷云台把激光对准靶心。激光与摄像头同轴，靶心居中即命中。
 >
 > 完整的项目总览、硬件清单、引脚表、部署与协议见根目录 **[`../README.md`](../README.md)**；舵机改造与滑环走线见 **[`servo_gimbal_design.md`](./servo_gimbal_design.md)**。
 
@@ -14,7 +14,7 @@
 
 | 功能 | 说明 |
 |------|------|
-| 双轴 PWM 控制 | Pan（水平，PB1/TIM3）、Tilt（俯仰，PA11/TIM1），50Hz，S20F 270°/180° 舵机 |
+| 双轴无刷控制 | Pan（水平，电机 ID1）/Tilt（俯仰，电机 ID2），WHEELTEC F32C 速度闭环（USART3 PB10 TX）；自锁保持角度，无“中位脉宽”概念 |
 | 位置闭环（默认）| 给定目标角度 → 位置 PID（Kp/Kd）→ 梯形加减速走到位置；软限位保护 |
 | **AUTO 自动打靶** | K230 误差帧 → 无积分速度控制器 `out = Kp·err + Kd·derr` + 减速区线性收敛；根治过冲 |
 | **粘性命中锁** | 命中（误差 < 容差）后双轴锁存停稳；仅当误差明显偏离（>40px）或丢帧才重捕，根治“打到靶上停不下来” |
@@ -24,7 +24,7 @@
 | **CRC8 校验** | K230→STM32 坐标帧带 CRC8（poly 0x07），防 EMI 篡改 |
 | **OLED 自动恢复** | 电机噪声打死 I2C 时自动重新初始化 |
 | 串口 / 实时调参 | UART 指令集 + 上位机 Web Serial；`g`/`pid` 命令实时改参（断电不保存）|
-| 蓝牙推送 | 每 150ms 紧凑单行遥测（Pan/Tilt 状态 + PID 输出 + 减速区）|
+| 控制台推送 | 每 150ms 紧凑单行遥测（Pan/Tilt 状态 + PID 输出 + 减速区），走 USART1 |
 
 ---
 
@@ -41,16 +41,17 @@
 
 | STM32 引脚 | 信号 | 说明 |
 | :---: | :---: | :--- |
-| **PB1** | Pan 舵机 PWM | TIM3_CH4，50Hz |
-| **PA11** | Tilt 舵机 PWM | TIM1_CH4，50Hz |
-| PB10 | K230 USART3 TX | → K230 RX (GPIO06) |
-| PB11 | K230 USART3 RX | ← K230 TX (GPIO05) |
-| PA9 / PA10 | 调试串口 TX / RX | USART1 @115200 |
-| PA2 / PA3 | 蓝牙 TX / RX | USART2 @9600（JDY-31）|
+| PB1 | 释放（无刷方案不用舵机 PWM）| 原 Pan 舵机 PWM（TIM3_CH4），现空置 |
+| PA11 | 释放（无刷方案不用舵机 PWM）| 原 Tilt 舵机 PWM（TIM1_CH4），现空置 |
+| PB10 | 无刷云台 USART3 TX | → F32C 驱动板 RXD（115200，单向 TX）|
+| PB11 | 释放（云台不开 RX）| 单向 TX，RX 悬空 |
+| PA9 / PA10 | 调试串口 TX / RX | USART1 @115200（CH340 接 PC）|
+| PA2 / PA3 | K230 视觉 USART2 TX / RX | → K230 RX/TX（GPIO06/05），115200 |
 | PB8 / PB9 | OLED SCL / SDA | I2C1 重映射，0x3C |
 | PB12~PB15 | 按键 UP/DOWN/DIR/MODE | 内部上拉，另一端接 GND |
 
-> 供电注意：舵机启动电流大，建议 **5V / ≥2A 独立供电**，勿与 MCU 共用 LDO。
+> 供电注意：无刷云台启动电流大，建议 **5V / ≥2A 独立供电**，勿与 MCU 共用 LDO。
+> **蓝牙（JDY-31）已于 v6.0 移除**：K230 从原 USART3 迁到 USART2，空出的 USART3 改接无刷云台；命令/遥测统一走 USART1（PA9/PA10）。
 
 ---
 
@@ -71,7 +72,7 @@
 
 ### AUTO 模式（K230 自动打靶 + 矩形循迹）
 
-- K230 通过 USART3 每帧发送误差帧（带 CRC8），约 30fps 级。
+- K230 通过 USART2（PA2/PA3）每帧发送误差帧（带 CRC8），约 30fps 级。
 - STM32 用**无积分速度控制器** `out = Kp·err + Kd·derr` 把误差映射成双轴速度。
 - **减速区**：误差进入减速区后速度线性归零，物理上不会过冲靶心。
 - **置信度门控 + 冻结**：靶心/激光任一带 `valid=0` 或置信度不足 2 帧 → 立即冻结（停机+重置 PID），不急停、不误发大误差。
@@ -102,10 +103,10 @@ main.c
 ├── SystemClock_Config()    → 72MHz (HSE 8MHz ×9 PLL)
 ├── GPIO_Init()             → 释放 PA4~PA7/PB0~PB7 旧线圈引脚；按键/LED/OLED 配置
 ├── USART1_Init()           → 调试串口 115200
-├── USART2_Init()           → 蓝牙 9600
-├── USART3_Init()           → K230 坐标帧 115200 (PB10/PB11)
-├── TIM1_Init()             → Tilt 舵机 PWM 50Hz (PA11=TIM1_CH4)
-├── TIM3_Init()             → Pan 舵机 PWM 50Hz (PB1=TIM3_CH4)
+├── USART2_Init()           → K230 视觉串口 115200 (PA2/PA3)
+├── USART3_Init()           → 无刷云台串口 115200 (PB10 TX)
+├── TIM1_Init()             → 弃用(空函数)
+├── TIM3_Init()             → 弃用(空函数, 无刷云台改走 USART3 后无需位时钟)
 ├── TIM2_Init() / TIM4_Init()→ Pan / Tilt 步进节拍定时器（虚拟步进 pos_steps）
 └── while(1)
     ├── Serial_Execute()    → 串口命令解析（位置闭环/实时调参/模式切换）
@@ -114,7 +115,7 @@ main.c
     ├── K230_ProcessFrame() → 误差帧 → 速度控制器 → 双轴控制（AUTO 模式）
     ├── K230_TimeoutCheck() → 2s 超时 / 持续无效帧安全停车
     ├── OLED_Refresh()      → 每 200ms 刷新
-    └── BT_SendReport()     → 每 150ms 紧凑单行遥测（蓝牙口）
+    └── U1_SendTelemetry()   → 每 150ms 紧凑单行遥测（USART1 控制台）
 ```
 
 > 设计要点：保留原“虚拟步进”模型（`pos_steps`，单位 0.1°）和全部已调好的 PID / 位置闭环算法，仅把最底层“GPIO 步进序列”换成“TIM PWM 角度映射”，追踪/定位逻辑零改动、风险最小。
@@ -153,7 +154,7 @@ arm-none-eabi-objcopy -O ihex .pio/build/bluepill_f103c8/firmware.elf servo_gimb
 pio device monitor
 ```
 
-波特率 115200（调试串口 PA9/PA10，接 CH340）。实时调参遥测走 **USART2@9600（蓝牙口）**。
+波特率 115200（调试串口 PA9/PA10，接 CH340）。实时调参遥测也走 **USART1@115200**（蓝牙口已于 v6.0 移除）。
 
 ---
 
@@ -168,7 +169,7 @@ pio device monitor
 | DIR | PB14 | 换向 CW ↔ CCW |
 | MODE | PB15 | 模式循环（上电默认 POSCTRL）|
 
-### 串口命令（115200 / 9600 蓝牙，回车结束）
+### 串口命令（USART1 @115200，回车结束）
 
 | 命令 | 功能 | 示例 |
 | ---- | ---- | ---- |
@@ -220,14 +221,14 @@ E:(+12,-5)
 
 ## 七、上位机（Web Serial 调试面板）
 
-`bluetooth_app/webserial.html` 用 Chrome/Edge 的 Web Serial API 直连 CH340（默认 9600，蓝牙口）：
+`bluetooth_app/webserial.html` 用 Chrome/Edge 的 Web Serial API 直连 CH340（**默认 115200**，v6.0 起蓝牙已移除，调试/遥测统一走 USART1）：
 
 - 串口连接 / 断开
 - **PID 实时调参面板**：Pan/Tilt 的 Kp/Ki/Kd 滑块，拖动即发 `g` 命令
 - **PID 双轴曲线**：误差(px) / PID 输出(±1)，含减速区与模式状态
 - 串口监视终端 + 自定义命令、手动云台控制、追踪状态卡
 
-> `bluetooth_app/posctrl.html` 是位置闭环专用调试页；`bluetooth_app/index.html` 是 Web Bluetooth（JDY-31）遥控路径，与 Web Serial 不是一套。
+> `bluetooth_app/posctrl.html` 是位置闭环专用调试页；`bluetooth_app/index.html` 原是 Web Bluetooth（JDY-31）遥控路径，**v6.0 蓝牙已移除，该页失效**，改用 `webserial.html`（Web Serial）调试。
 
 ---
 

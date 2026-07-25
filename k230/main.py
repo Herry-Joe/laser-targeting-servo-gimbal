@@ -732,8 +732,8 @@ class RectTrajectory:
     @staticmethod
     def _fillet_pts(prev, cur, nxt, r):
         """返回 (P_in, P_out, O): 入边切点、出边切点、圆弧圆心. r<=0 或共线时 O=None."""
-        vin = (cur[0] - prev[0], cur[1] - prev[1]); vin_len = math.hypot(*vin) or 1.0
-        vout = (nxt[0] - cur[0], nxt[1] - cur[1]); vout_len = math.hypot(*vout) or 1.0
+        vin = (cur[0] - prev[0], cur[1] - prev[1]); vin_len = math.sqrt(vin[0]*vin[0] + vin[1]*vin[1]) or 1.0
+        vout = (nxt[0] - cur[0], nxt[1] - cur[1]); vout_len = math.sqrt(vout[0]*vout[0] + vout[1]*vout[1]) or 1.0
         uin = (vin[0] / vin_len, vin[1] / vin_len)
         uout = (vout[0] / vout_len, vout[1] / vout_len)
         Pin = (cur[0] - uin[0] * r, cur[1] - uin[1] * r)
@@ -760,7 +760,7 @@ class RectTrajectory:
         edges = []
         for i in range(n):
             a = self.corners[i]; b = self.corners[(i + 1) % n]
-            edges.append(math.hypot(b[0] - a[0], b[1] - a[1]))
+            edges.append(math.sqrt((b[0]-a[0])**2 + (b[1]-a[1])**2))
         min_edge = min(edges) if edges else 1.0
         r = self.fillet * min_edge
         if r > 0.45 * min_edge: r = 0.45 * min_edge
@@ -773,7 +773,7 @@ class RectTrajectory:
                                         self.corners[(i + 1) % n], r))
 
         def dist2(a, b):
-            return math.hypot(a[0] - b[0], a[1] - b[1])
+            return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2)
 
         prev_pt = [None]
         def add(pt):
@@ -2086,13 +2086,16 @@ def main():
                 # Task1: 设定点 = 矩形中心 (A4 中心)
                 if traj_center_frame is not None:
                     desired_frame = traj_center_frame
-                    progress = 1.0 if (l_lock and
-                                       abs(lx_s - (traj_center_frame[0] * PROC_W / FRAME_W)) < 15
-                                       and abs(ly_s - (traj_center_frame[1] * PROC_H / FRAME_H)) < 15) else 0.5
-                    if progress >= 1.0:
-                        traj_done = True
+                    _cx = traj_center_frame[0] * PROC_W / FRAME_W
+                    _cy = traj_center_frame[1] * PROC_H / FRAME_H
+                    _conv = l_lock and abs(lx_s - _cx) < 15 and abs(ly_s - _cy) < 15
+                    progress = 1.0 if _conv else 0.5
+                    # [fix] 离开收敛区必须清除完成标志, 否则 traj_done 只置位不复位,
+                    # 会出现"done=True 但激光仍 ±100px 摆动"的假完成.
+                    traj_done = bool(_conv)
                 else:
                     desired_frame = None
+                    traj_done = False
             elif task_mode == TASK_BORDER and traj_locked and border_trace is not None:
                 # [v5.10] Task2 外框: BorderLineTrace 四线段轴对齐循迹
                 # 每条边只动一个轴 → 更快更稳, 无需拐角减速/停留
